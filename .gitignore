@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 编辑器临时文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

@@ -7,6 +7,75 @@ from aiohttp import web
 from server import PromptServer
 import folder_paths
 
+
+def sanitize_items(items):
+    """按官方 schema 规范化条目（就地修改）：
+    - 编辑器私有字段（下划线开头，如 _align）不进入输出；
+    - tags / palette 为空数组时整个字段删除；
+    - text 字段只属于 label == "text" 的条目。
+    """
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in [k for k in item if k.startswith("_")]:
+            item.pop(key, None)
+        for key in ("tags", "palette"):
+            if isinstance(item.get(key), list) and not item[key]:
+                item.pop(key, None)
+        if item.get("label") != "text":
+            item.pop("text", None)
+    return items
+
+
+def normalize_layout(data, fallback_w=None, fallback_h=None):
+    """把官方"草稿"格式统一成模型格式（ComfyUI 官方节点使用的那套）。
+
+    草稿： bbox_coord_space="abs"             + bbox_format="xyxy"（左上角原点，带 width/height）
+    模型： bbox_coord_space="abs_centralized" + bbox_format="yxyx"（画布中心原点）
+
+    返回 (data, width, height)，width/height 是草稿声明的画布尺寸（可能为 None）。
+    """
+    if not isinstance(data, dict):
+        return data, None, None
+
+    width = data.get("width") or fallback_w
+    height = data.get("height") or fallback_h
+
+    coord = str(data.get("bbox_coord_space") or "abs_centralized").lower()
+    fmt = str(data.get("bbox_format") or "yxyx").lower()
+    centered = coord == "abs_centralized"
+    yxyx = fmt == "yxyx"
+
+    if centered and yxyx:
+        return data, width, height
+    if not centered and not (width and height):
+        # 草稿是左上角原点，没有画布尺寸就无法换算，原样返回
+        return data, width, height
+
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            continue
+        a, b, c, d = bbox
+        if yxyx:
+            ymin, xmin, ymax, xmax = a, b, c, d
+        else:
+            xmin, ymin, xmax, ymax = a, b, c, d
+        if not centered:
+            xmin -= width / 2
+            xmax -= width / 2
+            ymin -= height / 2
+            ymax -= height / 2
+        item["bbox"] = [int(round(ymin)), int(round(xmin)), int(round(ymax)), int(round(xmax))]
+
+    data["bbox_coord_space"] = "abs_centralized"
+    data["bbox_format"] = "yxyx"
+    # 注意：width / height 保留。模型格式同样允许携带画布尺寸，
+    # 只在生成给下游的提示词时剥离（见 execute 里的 full_prompt）。
+    return data, width, height
+
 @PromptServer.instance.routes.post("/moss/extract_prompt")
 async def extract_moss_prompt(request):
     try:
@@ -231,6 +300,14 @@ class MOSS_JSON_Importer:
             # 因为没有画框，元素数组和边界框都为空，主提示词和完整提示词都是这段纯文本
             return {"ui": ui, "result": ([], [], prompt, prompt)}
 
+        # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
+        data, draft_w, draft_h = normalize_layout(data, canvas_width, canvas_height)
+        if draft_w and draft_h:
+            # 草稿声明了自己的画布，坐标换算必须与之一致
+            canvas_width, canvas_height = int(draft_w), int(draft_h)
+            ui["width"] = [canvas_width]
+            ui["height"] = [canvas_height]
+
         # ================= 修改从这里开始 =================
         
         # 1. 提取主提示词
@@ -260,9 +337,13 @@ class MOSS_JSON_Importer:
             y1, x1 = ymin + half_h, xmin + half_w
             y2, x2 = ymax + half_h, xmax + half_w
 
-            # 生成官方元素数组
+            # 生成官方元素数组。
+            # 官方元素的 type 只有 obj / text：character 和 object 一样走 obj，
+            # 角色身份由官方 MOSSImageLayoutPrompt 的 character_boxes 输入决定（填框序号）。
+            label = item.get("label", "object")
+            is_text = label == "text"
             element = {
-                "type": item.get("label", "object"),
+                "type": "text" if is_text else "obj",
                 "bbox": [
                     max(0, min(1000, round((y1 / canvas_height) * 1000))),
                     max(0, min(1000, round((x1 / canvas_width) * 1000))),
@@ -271,32 +352,43 @@ class MOSS_JSON_Importer:
                 ],
                 "desc": item.get("caption", ""),
             }
-            if "text" in item:
-                element["text"] = item["text"]
-            if "palette" in item:
-                element["color_palette"] = item["palette"]
+            # text 字段只属于 text 条目
+            if is_text:
+                element["text"] = item.get("text", "")
+            palette = item.get("palette")
+            if isinstance(palette, list) and palette:
+                element["color_palette"] = palette
+            tags = item.get("tags")
+            if isinstance(tags, list) and tags:
+                element["tags"] = tags
             elements.append(element)
 
             # 生成像素 BBox
-            label = item.get("label", "object")
             bbox_obj = {
                 "x": round(x1),
                 "y": round(y1),
                 "width": round(x2 - x1),
                 "height": round(y2 - y1),
                 "metadata": {
-                    "type": "text" if label == "text" else "obj",
-                    "text": item.get("text", ""),
+                    "type": "text" if is_text else "obj",
+                    "text": item.get("text", "") if is_text else "",
                     "desc": item.get("caption", ""),
                     "palette": item.get("palette", []) or []
                 }
             }
+            if isinstance(item.get("tags"), list) and item["tags"]:
+                bbox_obj["metadata"]["tags"] = item["tags"]
             bboxes.append(bbox_obj)
 
         # ================= 核心修复：完整提示词 =================
         # 如果画了框（元素数组不为空），就把整个 JSON 作为字符串输出；否则只输出主提示词。
         if elements:
-            full_prompt = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+            sanitize_items(items)  # 空数组字段 / 私有字段 / 非法 text 不进入提示词
+            # 提示词里不携带画布尺寸：模型只认 bbox
+            prompt_data = data
+            if isinstance(data, dict):
+                prompt_data = {k: v for k, v in data.items() if k not in ("width", "height")}
+            full_prompt = json.dumps(prompt_data, ensure_ascii=False, separators=(',', ':'))
         else:
             full_prompt = prompt
 

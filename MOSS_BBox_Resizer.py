@@ -1,6 +1,71 @@
 import json
 import math
 
+
+def sanitize_items(items):
+    """按官方 schema 规范化条目（就地修改）。与 MOSS_JSON_Importer 里的同名函数保持一致，
+    这里单独保留一份，避免两个节点模块互相依赖。
+    """
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        for key in [k for k in item if k.startswith("_")]:
+            item.pop(key, None)
+        for key in ("tags", "palette"):
+            if isinstance(item.get(key), list) and not item[key]:
+                item.pop(key, None)
+        if item.get("label") != "text":
+            item.pop("text", None)
+    return items
+
+
+def normalize_layout(data, fallback_w=None, fallback_h=None):
+    """把官方"草稿"格式统一成模型格式（与 MOSS_JSON_Importer 中的同名函数保持一致，
+    这里单独保留一份，避免两个节点模块互相依赖）。
+
+    草稿： bbox_coord_space="abs"             + bbox_format="xyxy"（左上角原点，带 width/height）
+    模型： bbox_coord_space="abs_centralized" + bbox_format="yxyx"（画布中心原点）
+    """
+    if not isinstance(data, dict):
+        return data, None, None
+
+    width = data.get("width") or fallback_w
+    height = data.get("height") or fallback_h
+
+    coord = str(data.get("bbox_coord_space") or "abs_centralized").lower()
+    fmt = str(data.get("bbox_format") or "yxyx").lower()
+    centered = coord == "abs_centralized"
+    yxyx = fmt == "yxyx"
+
+    if centered and yxyx:
+        return data, width, height
+    if not centered and not (width and height):
+        return data, width, height
+
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        bbox = item.get("bbox")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            continue
+        a, b, c, d = bbox
+        if yxyx:
+            ymin, xmin, ymax, xmax = a, b, c, d
+        else:
+            xmin, ymin, xmax, ymax = a, b, c, d
+        if not centered:
+            xmin -= width / 2
+            xmax -= width / 2
+            ymin -= height / 2
+            ymax -= height / 2
+        item["bbox"] = [int(round(ymin)), int(round(xmin)), int(round(ymax)), int(round(xmax))]
+
+    data["bbox_coord_space"] = "abs_centralized"
+    data["bbox_format"] = "yxyx"
+    # width / height 保留，由调用方决定是否更新/剥离
+    return data, width, height
+
+
 class MOSS_BBox_Resizer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -47,8 +112,11 @@ class MOSS_BBox_Resizer:
             if element["type"] == "text":
                 element["text"] = item.get("text", "")
             palette = item.get("palette", item.get("color_palette", []))
-            if palette:
+            if isinstance(palette, list) and palette:
                 element["color_palette"] = palette
+            tags = item.get("tags", [])
+            if isinstance(tags, list) and tags:
+                element["tags"] = tags
             elements.append(element)
         return elements
 
@@ -63,6 +131,12 @@ class MOSS_BBox_Resizer:
             print(f"[MOSS Resizer] JSON 解析失败: {e}")
             return {"ui": {"old_width": [old_width], "old_height": [old_height]},
                     "result": ([], layout_json, new_width, new_height)}
+
+        # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
+        data, draft_w, draft_h = normalize_layout(data, old_width, old_height)
+        if draft_w and draft_h:
+            # 草稿声明了自己的画布，它才是“原图尺寸”
+            old_width, old_height = int(draft_w), int(draft_h)
 
         items = data if isinstance(data, list) else data.get("items", [])
         if not items:
@@ -160,6 +234,11 @@ class MOSS_BBox_Resizer:
 
         final_data = items if isinstance(data, list) else data
         print(f"[MOSS Resizer] 模式: {mode_log}。映射: {actual_old_w}x{actual_old_h} -> {new_width}x{new_height}")
+        sanitize_items(items)  # 空数组字段 / 私有字段 / 非法 text 不进入输出
+        # 映射后画布就是目标尺寸；旧尺寸留着会误导下游，直接更新
+        if isinstance(final_data, dict) and ("width" in final_data or "height" in final_data):
+            final_data["width"] = new_width
+            final_data["height"] = new_height
         resized_json = json.dumps(final_data, ensure_ascii=False, separators=(',', ':'))
         return {"ui": {"old_width": [actual_old_w], "old_height": [actual_old_h]},
                 "result": (self._to_official_elements(items, new_width, new_height), resized_json,

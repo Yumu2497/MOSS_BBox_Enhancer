@@ -2,6 +2,92 @@ import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
 // ==========================================
+// 0. JSON 规范化（对齐官方 schema）
+// ==========================================
+//   · 编辑器内部字段（_align 等）不落盘
+//   · tags / palette 为空数组时，整个字段删除
+//   · text 字段只属于 label === "text" 的条目
+// 所有写回 layout_json 的路径都必须经过这里。
+
+// 记录哪些节点的管理面板当前是打开的。
+// ComfyUI 的全局撤销（Ctrl+Z）会重建整张图，节点被移除再新建，
+// 面板会跟着消失；靠这份记录在节点重建后自动把它恢复。
+const openPanelIds = new Set();
+
+function sanitizeItemForJson(item) {
+    if (!item || typeof item !== "object") return item;
+    const out = {};
+    for (const key of Object.keys(item)) {
+        if (key.startsWith("_")) continue;
+        const value = item[key];
+        if ((key === "tags" || key === "palette") && Array.isArray(value) && value.length === 0) continue;
+        if (key === "text" && item.label !== "text") continue;
+        out[key] = value;
+    }
+    return out;
+}
+
+function serializeLayout(data) {
+    if (Array.isArray(data)) {
+        return JSON.stringify(data.map(sanitizeItemForJson), null, 2);
+    }
+    if (!data || typeof data !== "object") return "{}";
+    const clone = { ...data };
+    if (Array.isArray(clone.items)) clone.items = clone.items.map(sanitizeItemForJson);
+    return JSON.stringify(clone, null, 2);
+}
+
+// 官方有两套坐标描述，统一以 ComfyUI 官方节点使用的“模型格式”为准：
+//   草稿： bbox_coord_space="abs"             + bbox_format="xyxy"（左上角原点，带 width/height）
+//   模型： bbox_coord_space="abs_centralized" + bbox_format="yxyx"（画布中心原点）
+function normalizeLayoutSchema(data, fallbackW, fallbackH) {
+    const result = { converted: false, width: null, height: null };
+    if (!data || typeof data !== "object" || Array.isArray(data)) return result;
+
+    // 只有 JSON 自己声明了 width/height 才回传（用于同步画布控件）
+    const declaredW = Number(data.width) || 0;
+    const declaredH = Number(data.height) || 0;
+    const width = declaredW || Number(fallbackW) || 0;
+    const height = declaredH || Number(fallbackH) || 0;
+    result.width = declaredW || null;
+    result.height = declaredH || null;
+
+    const coord = String(data.bbox_coord_space || "abs_centralized").toLowerCase();
+    const format = String(data.bbox_format || "yxyx").toLowerCase();
+    const centered = coord === "abs_centralized";
+    const yxyx = format === "yxyx";
+    if (centered && yxyx) return result; // 已经是模型格式
+
+    // 草稿是左上角原点，没有画布尺寸就没法换算
+    if (!centered && (!width || !height)) return result;
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    items.forEach((item) => {
+        const bbox = item && item.bbox;
+        if (!Array.isArray(bbox) || bbox.length !== 4) return;
+        const [a, b, c, d] = bbox;
+        let xmin, ymin, xmax, ymax;
+        if (yxyx) {
+            ymin = a; xmin = b; ymax = c; xmax = d;
+        } else {
+            xmin = a; ymin = b; xmax = c; ymax = d;
+        }
+        if (!centered) {
+            xmin -= width / 2; xmax -= width / 2;
+            ymin -= height / 2; ymax -= height / 2;
+        }
+        item.bbox = [Math.round(ymin), Math.round(xmin), Math.round(ymax), Math.round(xmax)];
+    });
+
+    data.bbox_coord_space = "abs_centralized";
+    data.bbox_format = "yxyx";
+    // 注意：width / height 保留。模型格式同样允许携带画布尺寸，
+    // 只是在生成给下游的提示词时才剥离（见 MOSS_JSON_Importer）。
+    result.converted = true;
+    return result;
+}
+
+// ==========================================
 // 1. MOSS_JSON_Importer 的快捷编辑功能
 // ==========================================
 app.registerExtension({
@@ -275,6 +361,15 @@ app.registerExtension({
             node.addWidget("button", "📋 打开边界框管理面板", null, () => {
                 createFloatingPanel(node, jsonWidget);
             });
+
+            // 🌟 节点被重建（例如 Ctrl+Z 触发整图 reconfigure）后自动恢复面板
+            if (openPanelIds.has(node.id)) {
+                setTimeout(() => {
+                    if (document.getElementById(`moss-bbox-panel-${node.id}`)) return;
+                    const w = node.widgets?.find((x) => x.name === "layout_json");
+                    if (w) createFloatingPanel(node, w);
+                }, 120);
+            }
             // 🌟 新增：导入图片提示词按钮
             node.addWidget("button", "📂 导入图片中的提示词JSON", null, () => {
                 console.log("[MOSS] 导入按钮被点击");
@@ -379,7 +474,7 @@ app.registerExtension({
                                     bbox_format: "yxyx"
                                 };
 
-                                jsonWidget.value = JSON.stringify(finalJson, null, 2);
+                                jsonWidget.value = serializeLayout(finalJson);
                                 if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
 
                                 const wWidget = node.widgets.find((w) => w.name === "canvas_width");
@@ -420,8 +515,29 @@ app.registerExtension({
             this.onRemoved = function () {
                 const panel = document.getElementById(`moss-bbox-panel-${node.id}`);
                 if (panel) panel.remove();
+                // 取色浮层、标签样式挂在 body/head 上，节点删除时要一并清理
+                document.getElementById(`moss-color-popup-${node.id}`)?.remove();
+                document.getElementById(`moss-color-popup-style-${node.id}`)?.remove();
+                document.getElementById(`moss-tag-style-${node.id}`)?.remove();
+                // 属性面板若处于独立悬浮态，它是挂在 body 上的
+                document.getElementById(`moss-editor-${node.id}`)?.remove();
+                // 键盘监听挂在 window 捕获阶段，节点删除时必须摘掉
+                if (node._mossKeyHandler) {
+                    window.removeEventListener("keydown", node._mossKeyHandler, true);
+                    node._mossKeyHandler = null;
+                }
                 node._mossPanelUpdate = null;
                 node._mossPendingBackground = null;
+
+                // 节点被移除：如果它是被整图重建掉的（Ctrl+Z），稍后会以同 id 重新出现，
+                // 那就保留"面板打开"的记录让新节点自动恢复；否则清掉。
+                if (openPanelIds.has(node.id)) {
+                    setTimeout(() => {
+                        const live = node.graph?.getNodeById?.(node.id);
+                        if (!live) openPanelIds.delete(node.id);
+                    }, 500);
+                }
+
                 return onRemoved?.apply(this, arguments);
             };
 
@@ -560,7 +676,7 @@ function createFloatingPanel(node, jsonWidget) {
     }
 
     if (needReset && finalJsonObj) {
-        jsonWidget.value = JSON.stringify(finalJsonObj, null, 2);
+        jsonWidget.value = serializeLayout(finalJsonObj);
         if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
     }
 
@@ -609,7 +725,12 @@ function createFloatingPanel(node, jsonWidget) {
     closeBtn.textContent = "✖";
     closeBtn.style.cssText =
         "background: transparent; border: none; color: #aaa; cursor: pointer; font-size: 16px; font-weight: bold;";
-    closeBtn.onclick = () => (panel.style.display = "none");
+    closeBtn.onclick = () => {
+        setDetached(false); // 悬浮态要先收回，否则它会留在页面上
+        panel.style.display = "none";
+        closeColorPopup();
+        openPanelIds.delete(node.id); // 用户主动关闭，不再自动恢复
+    };
     
     header.appendChild(titleLeft);
     header.appendChild(closeBtn);
@@ -633,6 +754,46 @@ function createFloatingPanel(node, jsonWidget) {
         "width: 100%; height: 100%; display: block; cursor: crosshair;";
     canvas.tabIndex = 0;
     canvasContainer.appendChild(canvas);
+
+    // ================= 画布右下角工具条（撤销 / 重做 / 重置视图） =================
+    const canvasTools = document.createElement("div");
+    canvasTools.style.cssText =
+        "position: absolute; right: 12px; bottom: 12px; display: flex; gap: 6px; z-index: 21;";
+    canvasContainer.appendChild(canvasTools);
+
+    const makeToolBtn = (text, title) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = text;
+        btn.title = title;
+        btn.style.cssText =
+            "background: rgba(30,30,30,0.9); border: 1px solid #555; color: #ccc; border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer; backdrop-filter: blur(6px); transition: background 0.12s, color 0.12s, border-color 0.12s, opacity 0.12s;";
+        btn.onmouseover = () => {
+            if (btn.disabled) return;
+            btn.style.background = "rgba(60,60,60,0.95)";
+            btn.style.color = "#fff";
+            btn.style.borderColor = "#777";
+        };
+        btn.onmouseout = () => {
+            btn.style.background = "rgba(30,30,30,0.9)";
+            btn.style.color = "#ccc";
+            btn.style.borderColor = "#555";
+        };
+        canvasTools.appendChild(btn);
+        return btn;
+    };
+
+    const undoBtn = makeToolBtn("↶ 撤销", "撤销上一步编辑");
+    const redoBtn = makeToolBtn("↷ 重做", "重做下一步");
+    const resetViewBtn = makeToolBtn("🎯 重置视图", "恢复画布的缩放与位移");
+    undoBtn.onclick = () => undoEdit();
+    redoBtn.onclick = () => redoEdit();
+    resetViewBtn.onclick = () => {
+        viewScale = 1.0;
+        viewX = 0;
+        viewY = 0;
+        drawCanvas();
+    };
 
     // ================= 新增：画布主提示词悬浮窗 =================
     const promptWrapper = document.createElement("div");
@@ -676,11 +837,18 @@ function createFloatingPanel(node, jsonWidget) {
     
     leftContainer.appendChild(canvasContainer);
 
-    // 画布下方的动态编辑面板
+    // 画布下方的动态编辑面板（属性面板）：默认吸附在画布底部，可切换成独立悬浮窗
     const editorContainer = document.createElement("div");
-    // 改为绝对定位，悬浮在画布底部
-    editorContainer.style.cssText =
+    editorContainer.className = "moss-editor";
+    editorContainer.id = `moss-editor-${node.id}`;
+
+    // 吸附态：画布底部整条
+    const DOCKED_STYLE =
         "position: absolute; bottom: 0; left: 0; width: 100%; box-sizing: border-box; display: none; flex-direction: column; padding: 10px 12px; background: rgba(30, 30, 30, 0.95); backdrop-filter: blur(10px); border-top: 1px solid #444; z-index: 10; max-height: 250px; overflow-y: auto;";
+    // 独立悬浮态：固定定位，可拖到屏幕任意位置
+    const DETACHED_STYLE =
+        "position: fixed; box-sizing: border-box; display: none; flex-direction: column; padding: 10px 12px; background: rgba(28, 28, 28, 0.98); backdrop-filter: blur(12px); border: 1px solid #555; border-radius: 8px; z-index: 2147482000; max-height: 70vh; overflow-y: auto; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.7);";
+    editorContainer.style.cssText = DOCKED_STYLE;
 
     // 类型 Tab 切换
     const tabContainer = document.createElement("div");
@@ -688,15 +856,54 @@ function createFloatingPanel(node, jsonWidget) {
         "display: flex; gap: 2px; margin-bottom: 10px; background: #111; padding: 2px; border-radius: 6px;";
     const objBtn = document.createElement("button");
     objBtn.textContent = "对象";
+    const charBtn = document.createElement("button");
+    charBtn.textContent = "角色";
     const textBtn = document.createElement("button");
     textBtn.textContent = "文字";
-    [objBtn, textBtn].forEach((btn) => {
+    [objBtn, charBtn, textBtn].forEach((btn) => {
         btn.style.cssText =
             "flex: 1; padding: 6px 0; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold; transition: 0.2s;";
     });
     tabContainer.appendChild(objBtn);
+    tabContainer.appendChild(charBtn);
     tabContainer.appendChild(textBtn);
+
+    // 🌟 独立悬浮按钮：位于属性面板右上角
+    const detachBtn = document.createElement("button");
+    detachBtn.type = "button";
+    detachBtn.textContent = "⧉";
+    detachBtn.title = "独立悬浮属性面板（也可在面板空白处双击）";
+    detachBtn.style.cssText =
+        "flex: 0 0 22px; height: 26px; padding: 0; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; color: #aaa; cursor: pointer; font-size: 12px; line-height: 1;";
+    detachBtn.onclick = (e) => {
+        e.stopPropagation();
+        toggleDetached();
+    };
+    tabContainer.appendChild(detachBtn);
+
     editorContainer.appendChild(tabContainer);
+
+    // 独立悬浮时才显示的拖动条（收在面板顶部，按住即可移动）
+    const detachBar = document.createElement("div");
+    detachBar.style.cssText =
+        "display: none; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 4px 8px; background: #2a2a2a; border: 1px solid #444; border-radius: 5px; font-size: 11px; color: #999; cursor: move; user-select: none;";
+    detachBar.innerHTML =
+        '<span>⠿ 按住此条拖动</span><span style="color:#666;">双击空白处收回</span>';
+    editorContainer.insertBefore(detachBar, editorContainer.firstChild);
+
+    // 官方 schema 的 label 只有 object / character / text 三种
+    const TYPE_TABS = [
+        { btn: objBtn, label: "object" },
+        { btn: charBtn, label: "character" },
+        { btn: textBtn, label: "text" },
+    ];
+    const updateTypeTabs = (label) => {
+        TYPE_TABS.forEach(({ btn, label: value }) => {
+            const active = label === value;
+            btn.style.background = active ? "#444" : "transparent";
+            btn.style.color = active ? "#fff" : "#888";
+        });
+    };
 
     // 文字输入框 (仅 text 类型显示)
     const textLabel = document.createElement("div");
@@ -725,32 +932,706 @@ function createFloatingPanel(node, jsonWidget) {
     colorLabel.style.cssText =
         "font-size: 11px; color: #888; margin-bottom: 4px;";
 
-    // 真正的颜色选择器，平时隐藏
-    const hiddenColorPicker = document.createElement("input");
-    hiddenColorPicker.type = "color";
-    hiddenColorPicker.style.cssText =
-        "position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none;";
-    editorContainer.appendChild(hiddenColorPicker);
+    // 取色器不再用原生 <input type="color">：它的弹窗位置由浏览器决定，无法夹取。
+    // 改为下方自绘浮层（colorPopup），位置完全可控。
 
     const paletteContainer = document.createElement("div");
     paletteContainer.style.cssText =
         "display: flex; flex-wrap: wrap; gap: 6px; align-items: center;";
 
-    const addColorBtn = document.createElement("button");
-    addColorBtn.textContent = "+";
-    addColorBtn.style.cssText =
-        "width: 24px; height: 24px; background: #333; border: 1px solid #555; border-radius: 4px; color: #ccc; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; padding: 0;";
-
-    paletteContainer.appendChild(addColorBtn);
     editorContainer.appendChild(colorLabel);
     editorContainer.appendChild(paletteContainer);
+
+    const tagsLabel = document.createElement("div");
+    tagsLabel.textContent = "标签";
+    tagsLabel.style.cssText = "font-size: 11px; color: #888; margin: 8px 0 4px;";
+    const tagsContainer = document.createElement("div");
+    tagsContainer.style.cssText = "display: flex; flex-wrap: wrap; gap: 6px; align-items: center;";
+    editorContainer.appendChild(tagsLabel);
+    editorContainer.appendChild(tagsContainer);
+
+    // 标签的悬浮/选中样式只能靠 CSS（内联样式写不了 :hover）
+    const tagStyle = document.createElement("style");
+    tagStyle.id = `moss-tag-style-${node.id}`;
+    tagStyle.textContent = `
+.moss-grip { flex: 0 0 auto; padding: 0 1px; color: #666; font-size: 13px; line-height: 1; letter-spacing: -1px; cursor: grab; user-select: none; transition: color 0.12s; }
+.moss-grip:hover { color: #bbb; }
+.moss-grip:active { cursor: grabbing; }
+.moss-row-placeholder { flex: 0 0 auto; border-radius: 4px; border: 1px dashed #4a9eff; background: rgba(74, 158, 255, 0.10); }
+.moss-editor > * { flex-shrink: 0; }
+.moss-editor .moss-tag { display: inline-block; padding: 3px 8px; border: 1px solid #555; border-radius: 12px; background: #333; color: #ccc; font-size: 11px; line-height: 1.4; cursor: pointer; user-select: none; transition: background 0.12s, border-color 0.12s, color 0.12s; }
+.moss-editor .moss-tag:hover { background: #414141; border-color: #8a8a8a; color: #fff; }
+.moss-editor .moss-tag.is-selected { background: #24405e; border-color: #4a9eff; color: #dbe9ff; }
+.moss-editor .moss-tag.is-selected:hover { background: #2c4c6e; border-color: #6bb0ff; }
+.moss-editor .moss-tag-input { width: 100px; padding: 2px 8px; border-radius: 12px; border: 1px solid #4a9eff; background: #111; color: #eee; font-size: 11px; outline: none; }
+.moss-editor .moss-chip-add { width: 24px; height: 24px; padding: 0; box-sizing: border-box; display: flex; align-items: center; justify-content: center; background: #333; border: 1px solid #555; border-radius: 4px; color: #ccc; cursor: pointer; font-size: 16px; line-height: 1; transition: background 0.12s, border-color 0.12s, color 0.12s; }
+.moss-editor .moss-chip-add:hover { background: #444; border-color: #8a8a8a; color: #fff; }
+.moss-editor .moss-swatch { width: 24px; height: 24px; box-sizing: border-box; border-radius: 4px; border: 2px solid #555; cursor: pointer; transition: border-color 0.12s, transform 0.12s, box-shadow 0.12s; }
+.moss-editor .moss-swatch:hover { border-color: #8a8a8a; transform: translateY(-1px); }
+.moss-editor .moss-swatch.is-selected { border-color: #4a9eff; box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.35); }
+.moss-editor .moss-swatch.is-selected:hover { border-color: #6bb0ff; }
+`;
+    document.head.appendChild(tagStyle);
+
+    let selectedPaletteIndex = -1;
+    // 记录“当前高亮”属于哪个框，切换框时才能把残留的选中态清掉
+    let selectedPaletteOwner = -1;
+    // 🌟 延时开浮层的定时器：双击必须在弹窗之前判定，所以单击要等一小会儿
+    let paletteClickTimer = null;
+
+    // 🌟 只切换选中样式，不重建 DOM（重建会打断取色浮层的锚点元素）
+    const refreshPaletteHighlight = () => {
+        paletteContainer.querySelectorAll("[data-color-idx]").forEach((el) => {
+            const idx = Number(el.dataset.colorIdx);
+            el.classList.toggle("is-selected", idx === selectedPaletteIndex);
+        });
+    };
+
+    // 🌟 删除指定色块（双击 / 右键 / Delete 键共用同一条路径）
+    const deletePaletteColor = (colorIdx) => {
+        const target = currentItems[activeIndex];
+        if (!target || !Array.isArray(target.palette)) return;
+        if (colorIdx < 0 || colorIdx >= target.palette.length) return;
+        if (paletteClickTimer) {
+            clearTimeout(paletteClickTimer);
+            paletteClickTimer = null;
+        }
+        closeColorPopup(false);
+        target.palette.splice(colorIdx, 1);
+        // 空数组不留字段
+        if (target.palette.length === 0) delete target.palette;
+        selectedPaletteIndex = -1;
+        syncEditorPanel();
+        saveEditorChanges();
+    };
+
+    const deleteSelectedPalette = () => {
+        if (activeIndex === -1 || selectedPaletteIndex < 0) return;
+        deletePaletteColor(selectedPaletteIndex);
+    };
+
+    // 🌟 「+」按钮：色块栏和标签栏共用同一套外观与行为
+    const makeAddChipButton = (title, onClick) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "moss-chip-add";
+        btn.textContent = "+";
+        btn.title = title;
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            onClick();
+        };
+        return btn;
+    };
+
+    // 🌟 调色板整行重建：色块在前、「+」永远排在最后（与标签栏一致）
+    const renderPalette = () => {
+        const item = currentItems[activeIndex];
+        paletteContainer.innerHTML = "";
+        if (!item) return;
+
+        // 换了框就清掉上一个框的选中态
+        if (selectedPaletteOwner !== activeIndex) {
+            selectedPaletteIndex = -1;
+            selectedPaletteOwner = activeIndex;
+        }
+
+        const palette = Array.isArray(item.palette) ? item.palette : [];
+
+        palette.forEach((color, colorIdx) => {
+            const swatch = document.createElement("div");
+            swatch.className = "moss-swatch" + (colorIdx === selectedPaletteIndex ? " is-selected" : "");
+            swatch.dataset.colorIdx = String(colorIdx);
+            swatch.tabIndex = 0;
+            swatch.style.backgroundColor = color;
+            swatch.title = "单击改颜色，双击或右键删除";
+
+            // 单击：先立刻高亮（反馈要即时），再延时开取色浮层——
+            // 那 200ms 是留给双击判定的，双击时绝不弹窗
+            swatch.onclick = (e) => {
+                e.stopPropagation();
+                selectedPaletteIndex = colorIdx;
+                selectedPaletteOwner = activeIndex;
+                // 色块和标签是互斥选中，避免 Delete 键删错对象
+                selectedTagIndex = -1;
+                refreshTagHighlight();
+                refreshPaletteHighlight();
+                swatch.focus();
+
+                if (paletteClickTimer) clearTimeout(paletteClickTimer);
+                paletteClickTimer = setTimeout(() => {
+                    paletteClickTimer = null;
+                    openColorPopup(swatch, colorIdx);
+                }, 200);
+            };
+
+            // 双击：先掐掉待开的浮层，再删除
+            swatch.ondblclick = (e) => {
+                e.stopPropagation();
+                if (paletteClickTimer) {
+                    clearTimeout(paletteClickTimer);
+                    paletteClickTimer = null;
+                }
+                closeColorPopup(false);
+                deletePaletteColor(colorIdx);
+            };
+
+            // 右键删除
+            swatch.oncontextmenu = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                closeColorPopup(false);
+                deletePaletteColor(colorIdx);
+            };
+
+            paletteContainer.appendChild(swatch);
+        });
+
+        paletteContainer.appendChild(
+            makeAddChipButton("添加颜色", () => {
+                if (activeIndex === -1) return;
+                const cur = currentItems[activeIndex];
+                if (!cur) return;
+                if (!Array.isArray(cur.palette)) cur.palette = [];
+                cur.palette.push("#FFFFFF");
+                const newIdx = cur.palette.length - 1;
+                selectedPaletteIndex = newIdx;
+                selectedPaletteOwner = activeIndex;
+                renderPalette();
+                saveEditorChanges();
+                // 新建后直接弹取色浮层，和标签栏「点 + 直接进编辑」对齐
+                const swatchEl = paletteContainer.querySelector(`[data-color-idx="${newIdx}"]`);
+                if (swatchEl) openColorPopup(swatchEl, newIdx);
+            })
+        );
+    };
+
+    // ================= 标签：选中 / 编辑 / 删除 =================
+    let selectedTagIndex = -1;
+    let selectedTagOwner = -1;
+    let editingTagIndex = null; // null=不在编辑; -1=新增; >=0=编辑已有
+
+    const refreshTagHighlight = () => {
+        tagsContainer.querySelectorAll(".moss-tag").forEach((el) => {
+            const idx = Number(el.dataset.tagIdx);
+            el.classList.toggle("is-selected", idx === selectedTagIndex);
+        });
+    };
+
+    const deleteTag = (tagIdx) => {
+        const item = currentItems[activeIndex];
+        if (!item || !Array.isArray(item.tags)) return;
+        if (tagIdx < 0 || tagIdx >= item.tags.length) return;
+        item.tags.splice(tagIdx, 1);
+        // 空数组不留字段
+        if (item.tags.length === 0) delete item.tags;
+        selectedTagIndex = -1;
+        editingTagIndex = null;
+        renderTags();
+        saveEditorChanges();
+    };
+
+    // 内联输入框：Enter 提交、Esc 取消、失焦提交（不再依赖原生 prompt，
+    // 原生 prompt 被浏览器拦截时会静默失败，表现为“点 + 没反应”）
+    const makeTagInput = (tagIdx, value) => {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "moss-tag-input";
+        input.value = value || "";
+        input.placeholder = tagIdx >= 0 ? "" : "新标签…";
+
+        let finished = false;
+        const finish = (ok) => {
+            if (finished) return;
+            finished = true;
+            const cur = currentItems[activeIndex];
+            let text = "";
+            if (ok && cur) {
+                text = input.value.trim();
+                if (text) {
+                    if (!Array.isArray(cur.tags)) cur.tags = [];
+                    if (tagIdx >= 0 && tagIdx < cur.tags.length) cur.tags[tagIdx] = text;
+                    else cur.tags.push(text);
+                    selectedTagIndex = tagIdx >= 0 ? tagIdx : cur.tags.length - 1;
+                    selectedTagOwner = activeIndex;
+                }
+            }
+            editingTagIndex = null;
+            renderTags();
+            if (text) saveEditorChanges();
+        };
+
+        input.addEventListener("keydown", (e) => {
+            // 别让编辑器的 Delete/Backspace 逻辑把标签误删
+            e.stopPropagation();
+            if (e.key === "Enter") {
+                e.preventDefault();
+                finish(true);
+            } else if (e.key === "Escape") {
+                e.preventDefault();
+                finish(false);
+            }
+        });
+        input.addEventListener("blur", () => finish(true));
+        return input;
+    };
+
+    const renderTags = () => {
+        const item = currentItems[activeIndex];
+        tagsContainer.innerHTML = "";
+        if (!item) return;
+
+        // 换了框就清掉上一个框的选中态，并退出编辑
+        if (selectedTagOwner !== activeIndex) {
+            selectedTagIndex = -1;
+            selectedTagOwner = activeIndex;
+            editingTagIndex = null;
+        }
+
+        const tags = Array.isArray(item.tags) ? item.tags : [];
+
+        tags.forEach((tag, idx) => {
+            if (editingTagIndex === idx) {
+                tagsContainer.appendChild(makeTagInput(idx, tag));
+                return;
+            }
+            const chip = document.createElement("span");
+            chip.className = "moss-tag" + (idx === selectedTagIndex ? " is-selected" : "");
+            chip.textContent = tag;
+            chip.dataset.tagIdx = String(idx);
+            chip.tabIndex = 0;
+            chip.title = "单击选中，双击编辑，右键或 Delete 删除";
+
+            chip.onclick = (e) => {
+                e.stopPropagation();
+                selectedTagIndex = idx;
+                selectedTagOwner = activeIndex;
+                // 色块和标签是互斥选中
+                selectedPaletteIndex = -1;
+                refreshPaletteHighlight();
+                chip.focus();
+                refreshTagHighlight();
+            };
+            chip.ondblclick = (e) => {
+                e.stopPropagation();
+                editingTagIndex = idx;
+                renderTags();
+            };
+            chip.oncontextmenu = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                deleteTag(idx);
+            };
+            tagsContainer.appendChild(chip);
+        });
+
+        if (editingTagIndex === -1) {
+            tagsContainer.appendChild(makeTagInput(-1, ""));
+        } else {
+            tagsContainer.appendChild(
+                makeAddChipButton("添加标签", () => {
+                    if (activeIndex === -1) return;
+                    editingTagIndex = -1;
+                    renderTags();
+                })
+            );
+        }
+
+        const editingInput = tagsContainer.querySelector(".moss-tag-input");
+        if (editingInput && document.activeElement !== editingInput) {
+            editingInput.focus();
+            editingInput.select();
+        }
+    };
+
+    editorContainer.addEventListener("keydown", (event) => {
+        if (event.key !== "Delete" && event.key !== "Backspace") return;
+        // 在输入框里打字时不要触发删除
+        const el = event.target;
+        if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
+        event.preventDefault();
+        // 先删选中的标签，没有选中标签再删选中的色块
+        if (selectedTagIndex >= 0 && selectedTagOwner === activeIndex) {
+            deleteTag(selectedTagIndex);
+            return;
+        }
+        deleteSelectedPalette();
+    });
+
+    // ================= 自绘取色浮层 =================
+    // 定位规则（全部由这里掌握，不交给浏览器）：
+    //   1. 默认贴在“被选中色块”的右上角，浮层整体位于色块上方；
+    //   2. 右边超出视口时停下，不再继续往右（只夹到视口右边缘）；
+    //   3. 无论如何都不会翻到色块下方。
+    const colorPopup = document.createElement("div");
+    colorPopup.id = `moss-color-popup-${node.id}`;
+    colorPopup.style.cssText =
+        "position: fixed; left: 0; top: 0; display: none; width: 208px; padding: 8px; box-sizing: border-box; " +
+        "background: rgba(32,32,32,0.98); border: 1px solid #555; border-radius: 8px; " +
+        "box-shadow: 0 10px 28px rgba(0,0,0,0.65); font-family: sans-serif; z-index: 2147483647;";
+    document.body.appendChild(colorPopup);
+
+    // 滑块拇指只能靠伪元素样式，内联样式管不到
+    const colorPopupStyle = document.createElement("style");
+    colorPopupStyle.id = `moss-color-popup-style-${node.id}`;
+    colorPopupStyle.textContent = `
+#${colorPopup.id} input[type="range"] { -webkit-appearance: none; appearance: none; background: transparent; }
+#${colorPopup.id} input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 2px solid #222; box-shadow: 0 0 0 1px #888; cursor: pointer; }
+#${colorPopup.id} input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: #fff; border: 2px solid #222; box-shadow: 0 0 0 1px #888; cursor: pointer; }
+`;
+    document.head.appendChild(colorPopupStyle);
+
+    // 饱和度/明度面板
+    const svBox = document.createElement("div");
+    svBox.style.cssText =
+        "position: relative; width: 100%; height: 108px; border-radius: 4px; cursor: crosshair; touch-action: none; user-select: none; background-color: #f00;";
+    const svCursor = document.createElement("div");
+    svCursor.style.cssText =
+        "position: absolute; left: 0; top: 0; width: 10px; height: 10px; margin: -5px 0 0 -5px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px rgba(0,0,0,0.7); pointer-events: none;";
+    svBox.appendChild(svCursor);
+    colorPopup.appendChild(svBox);
+
+    // 色相滑块
+    const hueInput = document.createElement("input");
+    hueInput.type = "range";
+    hueInput.min = "0";
+    hueInput.max = "360";
+    hueInput.step = "1";
+    hueInput.style.cssText =
+        "display: block; width: 100%; height: 14px; margin: 10px 0 0; border-radius: 7px; outline: none; cursor: pointer; " +
+        "background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);";
+    colorPopup.appendChild(hueInput);
+
+    // 预览 + 十六进制输入
+    const hexRow = document.createElement("div");
+    hexRow.style.cssText = "display: flex; align-items: center; gap: 6px; margin-top: 8px;";
+    const hexPreview = document.createElement("div");
+    hexPreview.style.cssText =
+        "width: 22px; height: 22px; flex-shrink: 0; border-radius: 4px; border: 1px solid #555;";
+    const hexInput = document.createElement("input");
+    hexInput.type = "text";
+    hexInput.spellcheck = false;
+    hexInput.style.cssText =
+        "flex: 1; min-width: 0; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; " +
+        "padding: 4px 6px; font-size: 12px; font-family: monospace; outline: none; text-transform: uppercase;";
+    hexRow.appendChild(hexPreview);
+    hexRow.appendChild(hexInput);
+    colorPopup.appendChild(hexRow);
+
+    // ---- 颜色换算 ----
+    const hsvToHex = (h, s, v) => {
+        const c = v * s;
+        const hp = (((h % 360) + 360) % 360) / 60;
+        const x = c * (1 - Math.abs((hp % 2) - 1));
+        let r = 0, g = 0, b = 0;
+        if (hp < 1) { r = c; g = x; }
+        else if (hp < 2) { r = x; g = c; }
+        else if (hp < 3) { g = c; b = x; }
+        else if (hp < 4) { g = x; b = c; }
+        else if (hp < 5) { r = x; b = c; }
+        else { r = c; b = x; }
+        const m = v - c;
+        const toHex = (n) =>
+            Math.round(Math.max(0, Math.min(1, n + m)) * 255)
+                .toString(16)
+                .padStart(2, "0");
+        return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
+    };
+
+    const hexToHsv = (hex) => {
+        let raw = String(hex || "").trim().replace(/^#/, "");
+        if (!/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(raw)) return { h: 0, s: 1, v: 1 };
+        if (raw.length === 3) raw = raw.split("").map((c) => c + c).join("");
+        const r = parseInt(raw.slice(0, 2), 16) / 255;
+        const g = parseInt(raw.slice(2, 4), 16) / 255;
+        const b = parseInt(raw.slice(4, 6), 16) / 255;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        const d = max - min;
+        let h = 0;
+        if (d !== 0) {
+            if (max === r) h = ((g - b) / d) % 6;
+            else if (max === g) h = (b - r) / d + 2;
+            else h = (r - g) / d + 4;
+            h *= 60;
+            if (h < 0) h += 360;
+        }
+        return { h: Math.round(h), s: max === 0 ? 0 : d / max, v: max };
+    };
+
+    const picker = { h: 0, s: 1, v: 1, colorIdx: -1 };
+    let pickerDirty = false;
+
+    // 把 picker 的当前颜色写回数据（不落盘），并刷新浮层
+    const applyPickerColor = () => {
+        const hex = hsvToHex(picker.h, picker.s, picker.v);
+
+        const pureHue = hsvToHex(picker.h, 1, 1);
+        svBox.style.backgroundImage =
+            `linear-gradient(to top, #000, rgba(0,0,0,0)), linear-gradient(to right, #fff, ${pureHue})`;
+        const boxW = svBox.clientWidth || 192;
+        const boxH = svBox.clientHeight || 108;
+        svCursor.style.left = `${picker.s * boxW}px`;
+        svCursor.style.top = `${(1 - picker.v) * boxH}px`;
+        if (String(hueInput.value) !== String(Math.round(picker.h))) {
+            hueInput.value = String(Math.round(picker.h));
+        }
+        hexPreview.style.backgroundColor = hex;
+        if (document.activeElement !== hexInput) hexInput.value = hex;
+
+        const item = currentItems[activeIndex];
+        if (
+            item &&
+            Array.isArray(item.palette) &&
+            picker.colorIdx >= 0 &&
+            picker.colorIdx < item.palette.length
+        ) {
+            if (item.palette[picker.colorIdx] !== hex) {
+                item.palette[picker.colorIdx] = hex;
+                pickerDirty = true;
+            }
+            const swatchEl = paletteContainer.querySelector(`[data-color-idx="${picker.colorIdx}"]`);
+            if (swatchEl) swatchEl.style.backgroundColor = hex;
+        }
+    };
+
+    const commitPickerColor = () => {
+        if (!pickerDirty) return;
+        pickerDirty = false;
+        // 不要在这里重建面板 DOM：commit 可能发生在 pointerdown 阶段，
+        // 重建会把「+」这类按钮换掉，导致紧接着的 click 落空。
+        saveEditorChanges();
+    };
+
+    const closeColorPopup = (commit = true) => {
+        if (colorPopup.style.display === "none") return;
+        colorPopup.style.display = "none";
+        picker.colorIdx = -1;
+        if (commit) commitPickerColor();
+        pickerDirty = false;
+    };
+
+    const openColorPopup = (anchorEl, colorIdx) => {
+        const item = currentItems[activeIndex];
+        if (!item) return;
+        // 延时开窗期间色块可能被重绘过，重新取一次锚点
+        if (!anchorEl || !anchorEl.isConnected) {
+            anchorEl = paletteContainer.querySelector(`[data-color-idx="${colorIdx}"]`);
+            if (!anchorEl) return;
+        }
+        const current = Array.isArray(item.palette) ? item.palette[colorIdx] : null;
+        const hsv = hexToHsv(current || "#FFFFFF");
+        picker.h = hsv.h;
+        picker.s = hsv.s;
+        picker.v = hsv.v;
+        picker.colorIdx = colorIdx;
+        pickerDirty = false;
+
+        selectedPaletteIndex = colorIdx;
+        selectedPaletteOwner = activeIndex;
+        refreshPaletteHighlight();
+
+        // 先显示再测量，否则 offsetHeight 为 0
+        colorPopup.style.display = "block";
+        applyPickerColor();
+        pickerDirty = false;
+
+        const popupW = colorPopup.offsetWidth;
+        const popupH = colorPopup.offsetHeight;
+        const rect = anchorEl.getBoundingClientRect();
+        const margin = 8;
+
+        // 默认：色块右上角外侧，且整体在色块上方
+        let left = rect.right + 6;
+        let top = rect.top - popupH - 6;
+
+        // 右边到界就停（不越过视口右边缘），左右都夹一次，保证不越界；
+        // 顶部同理，但绝不翻到色块下方
+        const maxLeft = Math.max(margin, window.innerWidth - margin - popupW);
+        if (left > maxLeft) left = maxLeft;
+        if (left < margin) left = margin;
+        if (top < margin) top = margin;
+
+        colorPopup.style.left = `${Math.round(left)}px`;
+        colorPopup.style.top = `${Math.round(top)}px`;
+    };
+
+    // ---- 浮层交互 ----
+    let isSvDragging = false;
+    const updateSvFromPointer = (e) => {
+        const rect = svBox.getBoundingClientRect();
+        const x = Math.min(Math.max(e.clientX - rect.left, 0), rect.width);
+        const y = Math.min(Math.max(e.clientY - rect.top, 0), rect.height);
+        picker.s = rect.width ? x / rect.width : 0;
+        picker.v = rect.height ? 1 - y / rect.height : 1;
+        applyPickerColor();
+    };
+
+    svBox.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        isSvDragging = true;
+        svBox.setPointerCapture?.(e.pointerId);
+        updateSvFromPointer(e);
+    });
+    svBox.addEventListener("pointermove", (e) => {
+        if (isSvDragging) updateSvFromPointer(e);
+    });
+    const endSvDrag = () => {
+        if (!isSvDragging) return;
+        isSvDragging = false;
+        commitPickerColor();
+    };
+    svBox.addEventListener("pointerup", endSvDrag);
+    svBox.addEventListener("pointercancel", endSvDrag);
+
+    hueInput.addEventListener("input", () => {
+        picker.h = Number(hueInput.value) || 0;
+        applyPickerColor();
+    });
+    hueInput.addEventListener("change", () => commitPickerColor());
+
+    hexInput.addEventListener("focus", () => hexInput.select());
+    hexInput.addEventListener("keydown", (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") {
+            e.preventDefault();
+            hexInput.blur();
+        } else if (e.key === "Escape") {
+            e.preventDefault();
+            closeColorPopup();
+        }
+    });
+    hexInput.addEventListener("change", () => {
+        const hsv = hexToHsv(hexInput.value);
+        picker.h = hsv.h;
+        picker.s = hsv.s;
+        picker.v = hsv.v;
+        applyPickerColor();
+        commitPickerColor();
+    });
+
+    // 点击浮层以外任何地方就收起；点色块自己除外（交给它的 click 重新定位）
+    document.addEventListener(
+        "pointerdown",
+        (e) => {
+            if (e.target.closest?.("[data-color-idx]")) return;
+            if (colorPopup.contains(e.target)) return;
+            // 还没弹出来的延时任务也要掐掉，否则点了别处它仍会冒出来
+            if (paletteClickTimer) {
+                clearTimeout(paletteClickTimer);
+                paletteClickTimer = null;
+            }
+            closeColorPopup();
+        },
+        true
+    );
+    document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closeColorPopup();
+    });
+
+    // ================= 属性面板：独立悬浮 / 收回 =================
+    let isPanelDetached = false;
+    let detachedPos = { x: 0, y: 0 };
+
+    const setDetached = (detached) => {
+        if (detached === isPanelDetached) return;
+        const wasVisible = editorContainer.style.display !== "none";
+        isPanelDetached = detached;
+
+        if (detached) {
+            // 以当前屏幕位置作为悬浮窗初始位置，并夹进视口
+            const rect = editorContainer.getBoundingClientRect();
+            const width = Math.min(380, Math.max(280, Math.round(rect.width) || 360));
+            const x = Math.min(Math.max(rect.left, 8), Math.max(8, window.innerWidth - width - 8));
+            const y = Math.min(Math.max(rect.top, 8), Math.max(8, window.innerHeight - 80));
+            detachedPos = { x, y };
+
+            editorContainer.style.cssText = DETACHED_STYLE;
+            editorContainer.style.width = `${width}px`;
+            editorContainer.style.left = `${x}px`;
+            editorContainer.style.top = `${y}px`;
+            document.body.appendChild(editorContainer);
+
+            detachBar.style.display = "flex";
+            detachBtn.textContent = "⤓";
+            detachBtn.title = "收回属性面板（也可在面板空白处双击）";
+        } else {
+            editorContainer.style.cssText = DOCKED_STYLE;
+            leftContainer.appendChild(editorContainer);
+            detachBar.style.display = "none";
+            detachBtn.textContent = "⧉";
+            detachBtn.title = "独立悬浮属性面板（也可在面板空白处双击）";
+        }
+
+        if (wasVisible) editorContainer.style.display = "flex";
+    };
+
+    const toggleDetached = () => {
+        if (activeIndex === -1) return; // 没有选中框时面板本身是隐藏的
+        setDetached(!isPanelDetached);
+    };
+
+    // 按住拖动条移动悬浮窗
+    let isDraggingDetached = false;
+    let detachGrabX = 0;
+    let detachGrabY = 0;
+
+    detachBar.addEventListener("pointerdown", (e) => {
+        if (e.target.closest("button")) return;
+        isDraggingDetached = true;
+        const rect = editorContainer.getBoundingClientRect();
+        detachGrabX = e.clientX - rect.left;
+        detachGrabY = e.clientY - rect.top;
+        detachBar.setPointerCapture?.(e.pointerId);
+        e.preventDefault();
+    });
+
+    detachBar.addEventListener("pointermove", (e) => {
+        if (!isDraggingDetached) return;
+        const w = editorContainer.offsetWidth || 360;
+        const x = Math.min(Math.max(e.clientX - detachGrabX, 0), Math.max(0, window.innerWidth - w));
+        const y = Math.min(Math.max(e.clientY - detachGrabY, 0), Math.max(0, window.innerHeight - 40));
+        detachedPos = { x, y };
+        editorContainer.style.left = `${x}px`;
+        editorContainer.style.top = `${y}px`;
+    });
+
+    const endDetachDrag = (e) => {
+        if (!isDraggingDetached) return;
+        isDraggingDetached = false;
+        detachBar.releasePointerCapture?.(e.pointerId);
+    };
+    detachBar.addEventListener("pointerup", endDetachDrag);
+    detachBar.addEventListener("pointercancel", endDetachDrag);
+
+    // 空白处双击：独立 / 收回
+    editorContainer.addEventListener("dblclick", (e) => {
+        const t = e.target;
+        if (t.closest("input, textarea, select, button, .moss-tag, .moss-tag-input, .moss-swatch, .moss-chip-add")) return;
+        toggleDetached();
+    });
+
+    // 窗口变小后把悬浮窗拉回可见区域
+    window.addEventListener("resize", () => {
+        if (!isPanelDetached) return;
+        const w = editorContainer.offsetWidth || 360;
+        const x = Math.min(detachedPos.x, Math.max(0, window.innerWidth - w));
+        const y = Math.min(detachedPos.y, Math.max(0, window.innerHeight - 40));
+        if (x !== detachedPos.x || y !== detachedPos.y) {
+            detachedPos = { x, y };
+            editorContainer.style.left = `${x}px`;
+            editorContainer.style.top = `${y}px`;
+        }
+    });
 
     leftContainer.appendChild(editorContainer);
     contentContainer.appendChild(leftContainer);
 
     const rightContainer = document.createElement("div");
+    // 锁死宽度：否则行内超长文本会通过 min-content 把整列撑宽，把左边画布挤窄
     rightContainer.style.cssText =
-        "flex: 0 0 280px; display: flex; flex-direction: column; background: #1e1e1e;";
+        "flex: 0 0 280px; width: 280px; min-width: 280px; max-width: 280px; overflow: hidden; display: flex; flex-direction: column; background: #1e1e1e;";
 
 
     const toolbar = document.createElement("div");
@@ -761,19 +1642,6 @@ function createFloatingPanel(node, jsonWidget) {
     // --- 第一行：视图与辅助工具 ---
     const topRow = document.createElement("div");
     topRow.style.cssText = "display: flex; justify-content: space-between; align-items: center; gap: 6px;";
-
-    const resetBtn = document.createElement("button");
-    resetBtn.textContent = "🎯 重置";
-    resetBtn.title = "重置视图 (缩放与位置)";
-    // 使用 flex:1 让三个控件平分宽度
-    resetBtn.style.cssText =
-        "flex: 1; background: #333; color: #ccc; border: 1px solid #555; padding: 6px 0; border-radius: 4px; cursor: pointer; font-size: 12px; text-align: center;";
-    resetBtn.onclick = () => {
-        viewScale = 1.0;
-        viewX = 0;
-        viewY = 0;
-        drawCanvas();
-    };
 
     const selectAllLabel = document.createElement("label");
     selectAllLabel.style.cssText =
@@ -808,7 +1676,10 @@ function createFloatingPanel(node, jsonWidget) {
     });
     gridSizeSelect.onchange = () => {
         GRID_SNAP = parseInt(gridSizeSelect.value);
-        drawCanvas(); // 立刻重绘画布，更新网格线
+        // 极小框的视觉代理边长跟随网格：16px 网格 → 16，32px 网格 → 32
+        sizeInput.max = String(Math.max(1, GRID_SNAP - 1));
+        syncEditorPanel(); // 刷新尺寸输入框上限与极小框状态
+        drawCanvas(); // 立刻重绘画布，更新网格线与极小框代理
     };
 
     snapWrapper.appendChild(snapCb);
@@ -816,7 +1687,6 @@ function createFloatingPanel(node, jsonWidget) {
     snapWrapper.appendChild(gridSizeSelect);
 
     // 最后把 snapWrapper 塞入顶部的 topRow 中
-    topRow.appendChild(resetBtn);
     topRow.appendChild(selectAllLabel);
     topRow.appendChild(snapWrapper);
     toolbar.appendChild(topRow);
@@ -843,9 +1713,40 @@ function createFloatingPanel(node, jsonWidget) {
 
     rightContainer.appendChild(toolbar);
 
+    // ================= 画布模式（summary.canvas） =================
+    // JSON 顶层字段，不属于背景图设置，单独放在工具栏下方
+    const canvasModePanel = document.createElement("div");
+    canvasModePanel.style.cssText =
+        "margin: 8px 10px 0; padding: 8px 10px; border: 1px solid #444; border-radius: 6px; display: flex; align-items: center; gap: 8px; background: #1a1a1a;";
+
+    const canvasModeLabel = document.createElement("span");
+    canvasModeLabel.textContent = "🧩 画布模式";
+    canvasModeLabel.style.cssText = "font-size: 12px; color: #aaa; white-space: nowrap;";
+
+    const canvasModeSelect = document.createElement("select");
+    canvasModeSelect.style.cssText =
+        "flex: 1; min-width: 0; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; outline: none; cursor: pointer; font-size: 12px;";
+    [
+        { value: "", label: "默认 (不设置)" },
+        { value: "single", label: "单图" },
+        { value: "multi_panel", label: "多面板/分镜" },
+        { value: "collage", label: "拼贴" },
+    ].forEach((opt) => {
+        const o = document.createElement("option");
+        o.value = opt.value;
+        o.textContent = opt.label;
+        canvasModeSelect.appendChild(o);
+    });
+
+    canvasModePanel.appendChild(canvasModeLabel);
+    canvasModePanel.appendChild(canvasModeSelect);
+    rightContainer.appendChild(canvasModePanel);
+
+    // （原「对齐 / 分布」面板已移除：构图以手操为主，不再占用右栏空间）
+
     // ================= 极小框控制面板 =================
     const smallBoxPanel = document.createElement("div");
-    smallBoxPanel.style.cssText = "margin: 10px; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
+    smallBoxPanel.style.cssText = "margin: 8px 10px 0; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
     
     const smallBoxTitle = document.createElement("div");
     smallBoxTitle.textContent = "📐 极小框控制";
@@ -930,8 +1831,10 @@ function createFloatingPanel(node, jsonWidget) {
         const item = currentItems[activeIndex];
         const oldBounds = getVisualBounds(item);
         
-        let size = enableSmallCb.checked ? (parseInt(sizeInput.value) || 8) : 16;
-        size = Math.max(1, Math.min(enableSmallCb.checked ? 15 : 16, size));
+        let size = enableSmallCb.checked
+            ? (parseInt(sizeInput.value) || Math.round(GRID_SNAP / 2))
+            : GRID_SNAP;
+        size = Math.max(1, Math.min(enableSmallCb.checked ? GRID_SNAP - 1 : GRID_SNAP, size));
         
         const finalXmin = Math.round((oldBounds.vXmin + oldBounds.vXmax) / 2 - size / 2);
         const finalYmin = Math.round((oldBounds.vYmin + oldBounds.vYmax) / 2 - size / 2);
@@ -949,8 +1852,8 @@ function createFloatingPanel(node, jsonWidget) {
         const item = currentItems[activeIndex];
         const oldBounds = getVisualBounds(item);
         
-        let size = parseInt(sizeInput.value) || 8;
-        size = Math.max(1, Math.min(15, size));
+        let size = parseInt(sizeInput.value) || Math.round(GRID_SNAP / 2);
+        size = Math.max(1, Math.min(GRID_SNAP - 1, size));
         sizeInput.value = size;
         
         const cx = (oldBounds.vXmin + oldBounds.vXmax) / 2;
@@ -966,7 +1869,7 @@ function createFloatingPanel(node, jsonWidget) {
 
     // 🌟 背景图控制面板（卡片化包装）
     const bgPanel = document.createElement("div");
-    bgPanel.style.cssText = "margin: 10px; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
+    bgPanel.style.cssText = "margin: 8px 10px 0; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
     
     // 添加区域标题
     const bgTitle = document.createElement("div");
@@ -1023,35 +1926,6 @@ function createFloatingPanel(node, jsonWidget) {
     bgUploadRow.appendChild(bgUploadLabel);
     bgUploadRow.appendChild(bgPasteBtn);
     bgPanel.appendChild(bgUploadRow);
-
-    // 🌟 新增：画布模式选择行
-    const canvasModeRow = document.createElement("div");
-    canvasModeRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 4px;";
-    
-    const canvasModeLabel = document.createElement("span");
-    canvasModeLabel.textContent = "画布模式";
-    canvasModeLabel.style.color = "#aaa";
-    canvasModeLabel.style.whiteSpace = "nowrap";
-
-    const canvasModeSelect = document.createElement("select");
-    canvasModeSelect.style.cssText = "flex: 1; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; outline: none; cursor: pointer; font-size: 12px;";
-    
-    const options = [
-        { value: "", label: "默认 (不设置)" },
-        { value: "single", label: "单图" },
-        { value: "multi_panel", label: "多面板/分镜" },
-        { value: "collage", label: "拼贴" }
-    ];
-    options.forEach(opt => {
-        const o = document.createElement("option");
-        o.value = opt.value;
-        o.textContent = opt.label;
-        canvasModeSelect.appendChild(o);
-    });
-
-    canvasModeRow.appendChild(canvasModeLabel);
-    canvasModeRow.appendChild(canvasModeSelect);
-    bgPanel.appendChild(canvasModeRow);
 
     const bgControlRow = document.createElement("div");
     bgControlRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px;";
@@ -1131,15 +2005,63 @@ function createFloatingPanel(node, jsonWidget) {
     rightContainer.appendChild(bgPanel);
 
     const listArea = document.createElement("div");
+    // min-width: 0 让列表可以被父级压缩，而不是用内容宽度把右栏顶宽
     listArea.style.cssText =
-        "display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; flex: 1;";
+        "display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; overflow-x: hidden; flex: 1; min-width: 0;";
     rightContainer.appendChild(listArea);
 
     contentContainer.appendChild(rightContainer);
     panel.appendChild(contentContainer);
     document.body.appendChild(panel);
 
-    // --- 拖拽面板逻辑 ---
+    // ================= 面板位置 / 尺寸持久化 =================
+    const PANEL_RECT_KEY = "moss.bbox.panelRect";
+    const savePanelRect = () => {
+        if (panel.style.display === "none") return;
+        const r = panel.getBoundingClientRect();
+        try {
+            localStorage.setItem(PANEL_RECT_KEY, JSON.stringify({
+                left: Math.round(r.left),
+                top: Math.round(r.top),
+                width: Math.round(r.width),
+                height: Math.round(r.height),
+            }));
+        } catch (_) {
+            /* 存储不可用时忽略 */
+        }
+    };
+    const restorePanelRect = () => {
+        let saved = null;
+        try {
+            saved = JSON.parse(localStorage.getItem(PANEL_RECT_KEY) || "null");
+        } catch (_) {
+            saved = null;
+        }
+        if (!saved || !Number.isFinite(saved.left) || !Number.isFinite(saved.top)) return;
+        const w = Math.min(Math.max(saved.width || 750, 450), Math.max(450, window.innerWidth - 16));
+        const h = Math.min(Math.max(saved.height || 600, 300), Math.max(300, window.innerHeight - 16));
+        const left = Math.min(Math.max(saved.left, 0), Math.max(0, window.innerWidth - w));
+        const top = Math.min(Math.max(saved.top, 0), Math.max(0, window.innerHeight - 40));
+        panel.style.transform = "none";
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.width = `${w}px`;
+        panel.style.height = `${h}px`;
+    };
+    restorePanelRect();
+
+    let saveRectTimer = null;
+    const queueSavePanelRect = () => {
+        if (saveRectTimer) clearTimeout(saveRectTimer);
+        saveRectTimer = setTimeout(savePanelRect, 300);
+    };
+    try {
+        // CSS resize 拖拽不会触发事件，用尺寸变化监听兜住
+        new ResizeObserver(queueSavePanelRect).observe(panel);
+    } catch (_) {
+        /* 老浏览器忽略 */
+    }
+
     // --- 拖拽面板逻辑 ---
     let isDraggingPanel = false,
         panelStartX,
@@ -1147,15 +2069,37 @@ function createFloatingPanel(node, jsonWidget) {
         panelStartLeft,
         panelStartTop;
 
+    // 🌟 拖拽边界：标题栏必须始终留在视口内，否则一旦拖出去就再也抓不回来
+    //   · 上边界：标题栏不能顶出视口顶部
+    //   · 下边界：标题栏不能掉出视口底部
+    //   · 左右：至少留 KEEP_W 宽，保证还抓得住标题栏
+    const clampPanelPosition = (left, top) => {
+        const w = panel.offsetWidth || 450;
+        const headerH = header.offsetHeight || 36;
+        const KEEP_W = Math.min(160, w);
+
+        const minLeft = -(w - KEEP_W);
+        const maxLeft = Math.max(minLeft, window.innerWidth - KEEP_W);
+        const maxTop = Math.max(0, window.innerHeight - headerH - 4);
+
+        return {
+            left: Math.min(Math.max(left, minLeft), maxLeft),
+            top: Math.min(Math.max(top, 0), maxTop),
+        };
+    };
+
     header.addEventListener("pointerdown", (e) => {
         if (e.target === closeBtn || e.target === helpBtn) return;
 
         isDraggingPanel = true;
         panelStartX = e.clientX;
         panelStartY = e.clientY;
+
+        // 换算成 left/top 之前先夹一次：窗口变小后重新打开也能自动回到可见区域
         const rect = panel.getBoundingClientRect();
-        panelStartLeft = rect.left;
-        panelStartTop = rect.top;
+        const pos = clampPanelPosition(rect.left, rect.top);
+        panelStartLeft = pos.left;
+        panelStartTop = pos.top;
         panel.style.transform = "none";
         panel.style.left = panelStartLeft + "px";
         panel.style.top = panelStartTop + "px";
@@ -1167,13 +2111,28 @@ function createFloatingPanel(node, jsonWidget) {
 
     header.addEventListener("pointermove", (e) => {
         if (!isDraggingPanel) return;
-        panel.style.left = panelStartLeft + e.clientX - panelStartX + "px";
-        panel.style.top = panelStartTop + e.clientY - panelStartY + "px";
+        const pos = clampPanelPosition(
+            panelStartLeft + e.clientX - panelStartX,
+            panelStartTop + e.clientY - panelStartY
+        );
+        panel.style.left = pos.left + "px";
+        panel.style.top = pos.top + "px";
     });
 
     header.addEventListener("pointerup", (e) => {
         isDraggingPanel = false;
         header.releasePointerCapture(e.pointerId);
+        savePanelRect();
+    });
+
+    // 窗口尺寸变化后，把已经拖出去的面板拉回可见区域
+    window.addEventListener("resize", () => {
+        if (panel.style.display === "none") return;
+        if (panel.style.transform !== "none") return; // 还没被拖动过，仍是居中布局
+        const rect = panel.getBoundingClientRect();
+        const pos = clampPanelPosition(rect.left, rect.top);
+        panel.style.left = pos.left + "px";
+        panel.style.top = pos.top + "px";
     });
 
     // --- 核心状态与变量 ---
@@ -1255,26 +2214,179 @@ function createFloatingPanel(node, jsonWidget) {
         );
     };
 
+    // ================= 撤销 / 重做 =================
+    const undoStack = [];
+    let undoIndex = -1;
+    let lastRecordAt = 0;
+    const UNDO_LIMIT = 100;
+
+    // snapshot 是写回后的完整 JSON；700ms 内的连续改动合并成一步（打字/连续微移）
+    const recordHistory = (snapshot, coalesce = true) => {
+        if (typeof snapshot !== "string") return;
+        if (undoIndex >= 0 && undoStack[undoIndex] === snapshot) return;
+        if (undoIndex < undoStack.length - 1) undoStack.length = undoIndex + 1;
+
+        const now = Date.now();
+        if (coalesce && undoIndex >= 0 && now - lastRecordAt < 700) {
+            undoStack[undoIndex] = snapshot;
+        } else {
+            undoStack.push(snapshot);
+            if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+            undoIndex = undoStack.length - 1;
+        }
+        lastRecordAt = now;
+        updateUndoButtons();
+    };
+
+    const applyHistory = (index) => {
+        if (index < 0 || index >= undoStack.length) return;
+        undoIndex = index;
+        const value = undoStack[index];
+        isUpdatingFromUI = true;
+        jsonWidget.value = value;
+        jsonWidget.callback?.(value);
+        isUpdatingFromUI = false;
+
+        // 保留选中态：撤销不应该把下方属性面板一起关掉
+        renderList(false);
+        const maxIdx = currentItems.length - 1;
+        if (activeIndex > maxIdx) activeIndex = -1;
+        selectedIndices.forEach((i) => {
+            if (i > maxIdx) selectedIndices.delete(i);
+        });
+        updateListSelection();
+        syncEditorPanel();
+        drawCanvas();
+        if (node.graph) node.graph.setDirtyCanvas(true, true);
+        lastRecordAt = 0; // 撤销/重做之后的下一次改动必须新开一步，不能合并掉当前状态
+        updateUndoButtons();
+    };
+    const undoEdit = () => applyHistory(undoIndex - 1);
+    const redoEdit = () => applyHistory(undoIndex + 1);
+
+    // 按钮可用状态：栈底/栈顶时置灰
+    const updateUndoButtons = () => {
+        const canUndo = undoIndex > 0;
+        const canRedo = undoIndex >= 0 && undoIndex < undoStack.length - 1;
+        [[undoBtn, canUndo], [redoBtn, canRedo]].forEach(([btn, enabled]) => {
+            if (!btn) return;
+            btn.disabled = !enabled;
+            btn.style.opacity = enabled ? "1" : "0.38";
+            btn.style.cursor = enabled ? "pointer" : "default";
+        });
+    };
+
+    // 编辑器内部状态（极小框对齐 / 锁定）不进 JSON，靠 bbox + 序号跨重绘继承
+    const carryEditorState = (prev, next) => {
+        if (!Array.isArray(prev) || !prev.length || !Array.isArray(next)) return;
+        const byBbox = new Map();
+        prev.forEach((it) => {
+            if (it && Array.isArray(it.bbox)) byBbox.set(it.bbox.join(","), it);
+        });
+        next.forEach((it, i) => {
+            if (!it) return;
+            const src = (Array.isArray(it.bbox) && byBbox.get(it.bbox.join(","))) || prev[i];
+            if (!src) return;
+            if (src._align && !it._align) it._align = src._align;
+            if (src._locked) it._locked = true;
+        });
+    };
+
+    // ================= 键盘微移 =================
+    const nudgeSelected = (dx, dy) => {
+        if (activeIndex === -1 && selectedIndices.size) {
+            activeIndex = selectedIndices.values().next().value;
+        }
+        const indices = selectedIndices.size
+            ? Array.from(selectedIndices)
+            : activeIndex >= 0 ? [activeIndex] : [];
+        if (!indices.length) return false;
+
+        const { w, h } = getCanvasSize();
+        const limitX = w / 2;
+        const limitY = h / 2;
+        let moved = false;
+
+        indices.forEach((i) => {
+            const item = currentItems[i];
+            if (!item || !Array.isArray(item.bbox)) return;
+            const [ymin, xmin, ymax, xmax] = item.bbox;
+            const bw = xmax - xmin;
+            const bh = ymax - ymin;
+            const nx = Math.max(-limitX, Math.min(xmin + dx, limitX - bw));
+            const ny = Math.max(-limitY, Math.min(ymin + dy, limitY - bh));
+            if (nx === xmin && ny === ymin) return;
+            item.bbox = [Math.round(ny), Math.round(nx), Math.round(ny + bh), Math.round(nx + bw)];
+            moved = true;
+        });
+
+        if (moved) saveEditorChanges();
+        return moved;
+    };
+
+    // ================= 键盘：方向键微移 =================
+    // ⚠️ Ctrl+Z 不再拦截：ComfyUI 的全局撤销会在更早阶段执行并把整图重建，
+    // 拦不住反而容易双触发。撤销/重做改由画布右下角的按钮触发。
+    const panelKeyHandler = (e) => {
+        if (!panel.contains(e.target)) return; // 只在面板内部生效
+
+        const t = e.target;
+        if (!t) return;
+        // 文本类输入框内交给原生行为；checkbox / 按钮 不算
+        const isTextEditable =
+            t.tagName === "TEXTAREA" ||
+            t.isContentEditable ||
+            (t.tagName === "INPUT" && !["checkbox", "radio", "button", "range", "color"].includes((t.type || "text").toLowerCase()));
+        if (isTextEditable || t.tagName === "SELECT") return;
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (activeIndex === -1 && selectedIndices.size === 0) return;
+
+        const step = e.shiftKey ? GRID_SNAP : 1;
+        let dx = 0;
+        let dy = 0;
+        if (e.key === "ArrowLeft") dx = -step;
+        else if (e.key === "ArrowRight") dx = step;
+        else if (e.key === "ArrowUp") dy = -step;
+        else if (e.key === "ArrowDown") dy = step;
+        else return;
+        e.preventDefault();
+        e.stopPropagation();
+        nudgeSelected(dx, dy);
+    };
+    window.addEventListener("keydown", panelKeyHandler, true);
+    node._mossKeyHandler = panelKeyHandler; // 节点删除时在 onRemoved 里摘掉
+
     // --- 编辑面板逻辑 ---
+    // 写回 JSON 时统一走模块级的 serializeLayout()，字段规则只保留一处
     const saveEditorChanges = () => {
         if (activeIndex === -1 || !currentItems[activeIndex]) return;
 
         currentItems.forEach(item => { if ("_isNew" in item) delete item._isNew; });
 
-        const data = Array.isArray(JSON.parse(jsonWidget.value))
+        let parsed = {};
+        try {
+            parsed = JSON.parse(jsonWidget.value);
+        } catch (_) {
+            parsed = {};
+        }
+        const data = Array.isArray(parsed)
             ? currentItems
-            : { ...JSON.parse(jsonWidget.value), items: currentItems };
+            : parsed && typeof parsed === "object"
+                ? { ...parsed, items: currentItems }
+                : { items: currentItems };
 
         isUpdatingFromUI = true;
-        jsonWidget.value = JSON.stringify(data, null, 2);
+        jsonWidget.value = serializeLayout(data);
         if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
         isUpdatingFromUI = false;
+        recordHistory(jsonWidget.value);
 
         // 实时更新右侧列表的文本显示（不整体重建列表，防止失去焦点）
+        // ⚠️ 必须按类名找：行首现在是拖动柄 span，querySelector("span") 会抓错元素
         const cbs = listArea.querySelectorAll("input[type='checkbox']");
         const row = cbs[activeIndex]?.parentElement;
         if (row) {
-            const span = row.querySelector("span");
+            const span = row.querySelector(".moss-row-label");
             const item = currentItems[activeIndex];
             const text =
                 item.caption || item.desc || `未命名 (${item.label || "object"})`;
@@ -1289,10 +2401,19 @@ function createFloatingPanel(node, jsonWidget) {
     const syncEditorPanel = () => {
         if (activeIndex === -1 || !currentItems[activeIndex]) {
             editorContainer.style.display = "none";
+            closeColorPopup(false);
+            // 属性面板收起时，右下角工具条回到画布底部
+            if (canvasTools) canvasTools.style.bottom = "12px";
             return;
         }
         editorContainer.style.display = "flex";
         const item = currentItems[activeIndex];
+        // 🌟 换了框就清掉上一个框残留的色块选中态（取色浮层也要跟着收起）
+        if (selectedPaletteOwner !== activeIndex) {
+            selectedPaletteIndex = -1;
+            selectedPaletteOwner = activeIndex;
+            closeColorPopup(false);
+        }
         const isText = item.label === "text";
 
         // 🌟 同步极小框 UI
@@ -1300,16 +2421,15 @@ function createFloatingPanel(node, jsonWidget) {
         enableSmallCb.checked = isExtreme;
         sizeInput.disabled = !isExtreme;
         alignSelect.disabled = !isExtreme;
+        // 上限跟着网格走：16px 网格 → 最大 15，32px 网格 → 最大 31
+        sizeInput.max = String(Math.max(1, GRID_SNAP - 1));
         if (isExtreme) {
             sizeInput.value = item.bbox[3] - item.bbox[1];
             alignSelect.value = item._align || "center";
         }
 
-        // 更新 Tab 状态
-        objBtn.style.background = isText ? "transparent" : "#444";
-        objBtn.style.color = isText ? "#888" : "#fff";
-        textBtn.style.background = isText ? "#444" : "transparent";
-        textBtn.style.color = isText ? "#fff" : "#888";
+        // 更新类型 Tab 状态（object / character / text）
+        updateTypeTabs(item.label || "object");
 
         // 显示/隐藏文字框
         textLabel.style.display = isText ? "block" : "none";
@@ -1323,57 +2443,37 @@ function createFloatingPanel(node, jsonWidget) {
             textArea.value = item.text || "";
         }
 
-        // 更新颜色 (动态生成多色块)
-        while (paletteContainer.children.length > 1) {
-            paletteContainer.removeChild(paletteContainer.lastChild);
+        // 调色板整行重建（色块在前、「+」在后）
+        renderPalette();
+
+        // 标签区整体重建（选中态 / 编辑态都在 renderTags 里处理）
+        renderTags();
+
+        // 属性面板展开时会盖住画布底部，把右下角工具条顶上去
+        if (canvasTools) {
+            const h = isPanelDetached ? 0 : editorContainer.offsetHeight;
+            canvasTools.style.bottom = `${h + 12}px`;
         }
-
-        const palette =
-            item.palette && Array.isArray(item.palette) ? item.palette : [];
-
-        palette.forEach((color, colorIdx) => {
-            const swatch = document.createElement("div");
-            swatch.style.cssText = `width: 24px; height: 24px; border-radius: 4px; cursor: pointer; border: 1px solid #555; position: relative; background-color: ${color};`;
-
-            // 点击色块修改颜色
-            swatch.onclick = (e) => {
-                e.stopPropagation();
-                hiddenColorPicker.value = color || "#ffffff";
-                hiddenColorPicker.onchange = () => {
-                    currentItems[activeIndex].palette[colorIdx] = hiddenColorPicker.value;
-                    syncEditorPanel();
-                    saveEditorChanges();
-                };
-                hiddenColorPicker.click();
-            };
-
-            // 双击色块删除
-            swatch.ondblclick = (e) => {
-                e.stopPropagation();
-                currentItems[activeIndex].palette.splice(colorIdx, 1);
-                syncEditorPanel();
-                saveEditorChanges();
-            };
-            swatch.title = "单击修改颜色，双击删除";
-
-            paletteContainer.appendChild(swatch);
-        });
     };
 
-    objBtn.onclick = () => {
+    const setItemLabel = (label) => {
         if (activeIndex === -1) return;
-        currentItems[activeIndex].label = "object";
+        const item = currentItems[activeIndex];
+        if (!item) return;
+        item.label = label;
+        if (label === "text") {
+            if (typeof item.text !== "string") item.text = "";
+        } else {
+            // 只有 text 类型才有 text 字段，切回对象/角色要删掉
+            delete item.text;
+        }
         syncEditorPanel();
         saveEditorChanges();
     };
 
-    textBtn.onclick = () => {
-        if (activeIndex === -1) return;
-        currentItems[activeIndex].label = "text";
-        if (!currentItems[activeIndex].text) currentItems[activeIndex].text = "";
-        syncEditorPanel();
-        saveEditorChanges();
-    };
+    objBtn.onclick = () => setItemLabel("object");
+    charBtn.onclick = () => setItemLabel("character");
+    textBtn.onclick = () => setItemLabel("text");
 
     descArea.addEventListener("input", () => {
         if (activeIndex === -1) return;
@@ -1387,43 +2487,35 @@ function createFloatingPanel(node, jsonWidget) {
         saveEditorChanges();
     });
 
-    addColorBtn.onclick = () => {
-        if (activeIndex === -1) return;
-        if (!currentItems[activeIndex].palette) {
-            currentItems[activeIndex].palette = [];
-        }
-        // 默认添加一个随机颜色或白色
-        currentItems[activeIndex].palette.push("#FFFFFF");
-        syncEditorPanel();
-        saveEditorChanges();
-    };
-
-    // 🌟 获取视觉上的 16x16 范围
+    // 🌟 获取视觉上的代理范围（边长 = 当前网格尺寸：16 或 32）
     const getVisualBounds = (item) => {
         const [ymin, xmin, ymax, xmax] = item.bbox;
         const realW = xmax - xmin;
         const realH = ymax - ymin;
-        if (realW >= 16 && realH >= 16) {
+        // 极小框的视觉代理边长跟随网格尺寸（16 → 16，32 → 32）
+        const T = GRID_SNAP;
+        if (realW >= T && realH >= T) {
             return { vXmin: xmin, vYmin: ymin, vXmax: xmax, vYmax: ymax, isExtreme: false };
         }
 
         // 极小框
+        const half = T / 2;
         const align = item._align || "center";
-        let vXmin = xmin, vYmin = ymin, vXmax = xmin + 16, vYmax = ymin + 16;
+        let vXmin = xmin, vYmin = ymin, vXmax = xmin + T, vYmax = ymin + T;
 
         if (align === "center") {
             const cx = (xmin + xmax) / 2;
             const cy = (ymin + ymax) / 2;
-            vXmin = cx - 8; vXmax = cx + 8;
-            vYmin = cy - 8; vYmax = cy + 8;
+            vXmin = cx - half; vXmax = cx + half;
+            vYmin = cy - half; vYmax = cy + half;
         } else if (align === "tl") {
-            vXmin = xmin; vYmin = ymin; vXmax = xmin + 16; vYmax = ymin + 16;
+            vXmin = xmin; vYmin = ymin; vXmax = xmin + T; vYmax = ymin + T;
         } else if (align === "tr") {
-            vXmin = xmax - 16; vYmin = ymin; vXmax = xmax; vYmax = ymin + 16;
+            vXmin = xmax - T; vYmin = ymin; vXmax = xmax; vYmax = ymin + T;
         } else if (align === "bl") {
-            vXmin = xmin; vYmin = ymax - 16; vXmax = xmin + 16; vYmax = ymax;
+            vXmin = xmin; vYmin = ymax - T; vXmax = xmin + T; vYmax = ymax;
         } else if (align === "br") {
-            vXmin = xmax - 16; vYmin = ymax - 16; vXmax = xmax; vYmax = ymax;
+            vXmin = xmax - T; vYmin = ymax - T; vXmax = xmax; vYmax = ymax;
         }
 
         return { vXmin, vYmin, vXmax, vYmax, isExtreme: true };
@@ -1434,24 +2526,25 @@ function createFloatingPanel(node, jsonWidget) {
         const [ymin, xmin, ymax, xmax] = item.bbox;
         const realW = xmax - xmin;
         const realH = ymax - ymin;
-        if (realW >= 16 && realH >= 16) return; // 只有极小框需要反向映射
+        const T = GRID_SNAP;
+        if (realW >= T && realH >= T) return; // 只有极小框需要反向映射
 
         const align = item._align || "center";
         let newXmin = xmin, newYmin = ymin, newXmax = xmax, newYmax = ymax;
 
         if (align === "center") {
-            const cx = vXmin + 8;
-            const cy = vYmin + 8;
+            const cx = vXmin + T / 2;
+            const cy = vYmin + T / 2;
             newXmin = cx - realW / 2; newXmax = cx + realW / 2;
             newYmin = cy - realH / 2; newYmax = cy + realH / 2;
         } else if (align === "tl") {
             newXmin = vXmin; newYmin = vYmin; newXmax = vXmin + realW; newYmax = vYmin + realH;
         } else if (align === "tr") {
-            newXmin = vXmin + 16 - realW; newYmin = vYmin; newXmax = vXmin + 16; newYmax = vYmin + realH;
+            newXmin = vXmin + T - realW; newYmin = vYmin; newXmax = vXmin + T; newYmax = vYmin + realH;
         } else if (align === "bl") {
-            newXmin = vXmin; newYmin = vYmin + 16 - realH; newXmax = vXmin + realW; newYmax = vYmin + 16;
+            newXmin = vXmin; newYmin = vYmin + T - realH; newXmax = vXmin + realW; newYmax = vYmin + T;
         } else if (align === "br") {
-            newXmin = vXmin + 16 - realW; newYmin = vYmin + 16 - realH; newXmax = vXmin + 16; newYmax = vYmin + 16;
+            newXmin = vXmin + T - realW; newYmin = vYmin + T - realH; newXmax = vXmin + T; newYmax = vYmin + T;
         }
 
         item.bbox = [Math.round(newYmin), Math.round(newXmin), Math.round(newYmax), Math.round(newXmax)];
@@ -1977,8 +3070,8 @@ function createFloatingPanel(node, jsonWidget) {
                 newVx = applySnap(newVx, e.altKey, true);
                 newVy = applySnap(newVy, e.altKey, false);
 
-                newVx = Math.max(-limitX, Math.min(newVx, limitX - 16));
-                newVy = Math.max(-limitY, Math.min(newVy, limitY - 16));
+                newVx = Math.max(-limitX, Math.min(newVx, limitX - GRID_SNAP));
+                newVy = Math.max(-limitY, Math.min(newVy, limitY - GRID_SNAP));
 
                 applyVisualBounds(currentItems[activeIndex], newVx, newVy);
             } else {
@@ -2074,20 +3167,21 @@ function createFloatingPanel(node, jsonWidget) {
                         return;
                     }
 
-                    // 2. 缩放到小于 16，强制变为正方形极小框
-                    if (currentDragMode && currentDragMode.startsWith("resize") && (w < 16 || h < 16)) {
+                    // 2. 缩放到小于网格尺寸时，强制变为正方形极小框
+                    if (currentDragMode && currentDragMode.startsWith("resize") && (w < GRID_SNAP || h < GRID_SNAP)) {
                         const finalSize = Math.max(1, Math.min(w, h));
                         
                         // 🌟 核心修复：在这里获取画布尺寸，防止 limitX 报错！
                         const { w: canvasW, h: canvasH } = getCanvasSize();
                         const limitX = canvasW / 2;
                         const limitY = canvasH / 2;
+                        const halfT = GRID_SNAP / 2;
 
-                        // 计算 16x16 视觉框的安全中心点，防止视觉框溢出画布
+                        // 计算视觉代理框的安全中心点，防止视觉框溢出画布
                         let cx = (xmin + xmax) / 2;
                         let cy = (ymin + ymax) / 2;
-                        cx = Math.max(-limitX + 8, Math.min(cx, limitX - 8));
-                        cy = Math.max(-limitY + 8, Math.min(cy, limitY - 8));
+                        cx = Math.max(-limitX + halfT, Math.min(cx, limitX - halfT));
+                        cy = Math.max(-limitY + halfT, Math.min(cy, limitY - halfT));
 
                         const finalXmin = Math.round(cx - finalSize / 2);
                         const finalYmin = Math.round(cy - finalSize / 2);
@@ -2294,9 +3388,10 @@ function createFloatingPanel(node, jsonWidget) {
                 selectedIndices.clear();
 
                 isUpdatingFromUI = true;
-                jsonWidget.value = JSON.stringify(data, null, 2);
+                jsonWidget.value = serializeLayout(data);
                 if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
                 isUpdatingFromUI = false;
+                recordHistory(jsonWidget.value, false);
                 renderList();
                 syncEditorPanel();
                 drawCanvas();
@@ -2405,9 +3500,10 @@ function createFloatingPanel(node, jsonWidget) {
             data.summary.caption = val;
 
             isUpdatingFromUI = true;
-            jsonWidget.value = JSON.stringify(data, null, 2);
+            jsonWidget.value = serializeLayout(data);
             if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
             isUpdatingFromUI = false;
+            recordHistory(jsonWidget.value);
             
             if (node.graph) node.graph.setDirtyCanvas(true, true);
         } catch (e) {
@@ -2432,14 +3528,193 @@ function createFloatingPanel(node, jsonWidget) {
             }
 
             isUpdatingFromUI = true;
-            jsonWidget.value = JSON.stringify(data, null, 2);
+            jsonWidget.value = serializeLayout(data);
             if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
             isUpdatingFromUI = false;
+            recordHistory(jsonWidget.value, false);
             
             if (node.graph) node.graph.setDirtyCanvas(true, true);
         } catch (e) {
             console.error("[MOSS] 更新 canvas 字段失败:", e);
         }
+    };
+
+    // ================= 列表拖动排序 =================
+    let listDrag = null;
+
+    const listRows = () =>
+        Array.from(listArea.children).filter((el) => el.dataset && el.dataset.index !== undefined);
+
+    const snapshotTops = (rows) => {
+        const map = new Map();
+        rows.forEach((el) => map.set(el, el.getBoundingClientRect()));
+        return map;
+    };
+
+    // FLIP：先反向位移，再过渡回原位，得到平滑的让位动画
+    const animateRows = (rows, beforeMap) => {
+        rows.forEach((el) => {
+            const before = beforeMap.get(el);
+            if (!before) return;
+            const after = el.getBoundingClientRect();
+            const dy = before.top - after.top;
+            if (Math.abs(dy) < 1) return;
+            el.style.transition = "none";
+            el.style.transform = `translateY(${dy}px)`;
+            void el.offsetHeight; // 强制回流，让上面的位移立即生效
+            el.style.transition = "transform 0.16s cubic-bezier(0.2, 0.8, 0.3, 1)";
+            el.style.transform = "";
+        });
+    };
+
+    const onRowDragMove = (e) => {
+        if (!listDrag) return;
+        const { row, placeholder } = listDrag;
+        // 拖动期间列表被重建（例如外部触发了 renderList），直接放弃这次拖动
+        if (!row.isConnected || !placeholder.isConnected) return;
+
+        row.style.top = `${e.clientY - listDrag.grabOffsetY - listDrag.panelTop}px`;
+
+        const rowsNow = listRows().filter((el) => el !== row);
+        const beforeMap = snapshotTops(rowsNow);
+        const others = rowsNow.filter((el) => el !== placeholder);
+
+        // 指针落在哪一行的上半部之前，就插到那一行前面
+        let ref = null;
+        for (const el of others) {
+            const r = el.getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) {
+                ref = el;
+                break;
+            }
+        }
+
+        const alreadyThere = ref
+            ? placeholder.nextElementSibling === ref
+            : placeholder === listArea.lastElementChild;
+        if (alreadyThere) return;
+
+        if (ref) listArea.insertBefore(placeholder, ref);
+        else listArea.appendChild(placeholder);
+
+        animateRows(rowsNow, beforeMap);
+    };
+
+    const onRowDragEnd = () => {
+        if (!listDrag) return;
+        const { row, placeholder, fromIndex, origCss } = listDrag;
+
+        window.removeEventListener("pointermove", onRowDragMove);
+        window.removeEventListener("pointerup", onRowDragEnd);
+        window.removeEventListener("pointercancel", onRowDragEnd);
+        document.body.style.userSelect = "";
+        document.body.style.cursor = "";
+
+        row.classList.remove("is-dragging");
+        row.style.cssText = origCss;
+
+        // 占位符已经被列表重建清掉时，只要把行收回来即可
+        if (!placeholder.isConnected) {
+            row.remove();
+            listDrag = null;
+            renderList();
+            return;
+        }
+
+        // 占位符前面有多少个真实行，就是新的落点
+        const all = Array.from(listArea.children);
+        const toIndex = all
+            .slice(0, all.indexOf(placeholder))
+            .filter((el) => el.dataset.index !== undefined).length;
+
+        listArea.insertBefore(row, placeholder);
+        placeholder.remove();
+        listDrag = null;
+
+        if (toIndex === fromIndex) {
+            updateListSelection();
+            return;
+        }
+
+        // 重排数据并写回 JSON
+        const [moved] = currentItems.splice(fromIndex, 1);
+        currentItems.splice(toIndex, 0, moved);
+
+        try {
+            let parsed = JSON.parse(jsonWidget.value || "{}");
+            if (Array.isArray(parsed)) {
+                parsed = currentItems;
+            } else {
+                parsed.items = currentItems;
+            }
+            isUpdatingFromUI = true;
+            jsonWidget.value = serializeLayout(parsed);
+            if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
+            isUpdatingFromUI = false;
+            recordHistory(jsonWidget.value, false);
+        } catch (err) {
+            console.error("[MOSS] 排序写回失败:", err);
+        }
+
+        renderList();
+        selectedIndices.clear();
+        selectedIndices.add(toIndex);
+        activeIndex = toIndex;
+        updateListSelection();
+        syncEditorPanel();
+        drawCanvas();
+        if (node.graph) node.graph.setDirtyCanvas(true, true);
+    };
+
+    const beginRowDrag = (e, row, index) => {
+        if (listDrag || currentItems.length < 2) return;
+        e.preventDefault();
+        e.stopPropagation();
+
+        const rect = row.getBoundingClientRect();
+        const panelRect = panel.getBoundingClientRect();
+        const placeholder = document.createElement("div");
+        placeholder.className = "moss-row-placeholder";
+        placeholder.style.height = `${rect.height}px`;
+        placeholder.style.boxSizing = "border-box";
+
+        const origCss = row.style.cssText;
+        row.parentElement.insertBefore(placeholder, row);
+
+        row.dataset.index = String(index);
+        row.classList.add("is-dragging");
+        // 🌟 挂在主面板内部并用面板相对坐标：
+        // 挂到 body 上会受页面变换/视口影响，可能撑出滚动条把左侧画布挤窄
+        row.style.position = "absolute";
+        row.style.boxSizing = "border-box";
+        row.style.left = `${rect.left - panelRect.left}px`;
+        row.style.top = `${rect.top - panelRect.top}px`;
+        row.style.width = `${rect.width}px`;
+        row.style.height = `${rect.height}px`;
+        row.style.margin = "0";
+        row.style.zIndex = "9999";
+        row.style.pointerEvents = "none";
+        row.style.opacity = "0.98";
+        row.style.boxShadow = "0 12px 26px rgba(0, 0, 0, 0.65)";
+        row.style.transition = "box-shadow 0.15s ease";
+        panel.appendChild(row);
+
+        listDrag = {
+            row,
+            placeholder,
+            fromIndex: index,
+            origCss,
+            grabOffsetY: e.clientY - rect.top,
+            pointerId: e.pointerId,
+            panelTop: panelRect.top,
+        };
+
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "grabbing";
+
+        window.addEventListener("pointermove", onRowDragMove);
+        window.addEventListener("pointerup", onRowDragEnd);
+        window.addEventListener("pointercancel", onRowDragEnd);
     };
 
     const renderList = (resetActive = true) => {
@@ -2454,9 +3729,11 @@ function createFloatingPanel(node, jsonWidget) {
         listArea.innerHTML = "";
         selectAllCb.checked = false;
 
+        const prevItems = currentItems;
         try {
             const data = JSON.parse(jsonWidget.value || "{}");
             currentItems = Array.isArray(data) ? data : data.items || [];
+            carryEditorState(prevItems, currentItems);
 
             knownBboxHistory.clear();
             currentItems.forEach(item => {
@@ -2481,9 +3758,17 @@ function createFloatingPanel(node, jsonWidget) {
             // 🌟 极小框红色高亮
             const realW = item.bbox[3] - item.bbox[1];
             const realH = item.bbox[2] - item.bbox[0];
-            const isExtreme = realW < 16 || realH < 16;
+            const isExtreme = realW < GRID_SNAP || realH < GRID_SNAP;
             
-            row.style.cssText = `display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: #2a2a2a; border-radius: 4px; border: 1px solid ${isExtreme ? '#ff4a4a' : '#333'}; flex-shrink: 0; cursor: pointer;`;
+            row.style.cssText = `display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: #2a2a2a; border-radius: 4px; border: 1px solid ${isExtreme ? '#ff4a4a' : '#333'}; flex-shrink: 0; min-width: 0; cursor: pointer;`;
+            row.dataset.index = String(index);
+
+            // 🌟 左侧六点拖动柄：按住即可上下拖动排序
+            const grip = document.createElement("span");
+            grip.className = "moss-grip";
+            grip.textContent = "⠿";
+            grip.title = "按住拖动排序";
+            grip.addEventListener("pointerdown", (e) => beginRowDrag(e, row, index));
 
             const cb = document.createElement("input");
             cb.type = "checkbox";
@@ -2505,6 +3790,7 @@ function createFloatingPanel(node, jsonWidget) {
             });
 
             row.addEventListener("click", (e) => {
+                if (e.target.closest?.(".moss-grip")) return; // 拖动柄不触发选中
                 if (e.target !== cb && e.target.tagName !== "BUTTON") {
                     if (e.ctrlKey || e.metaKey) {
                         cb.checked = !cb.checked;
@@ -2519,11 +3805,12 @@ function createFloatingPanel(node, jsonWidget) {
             });
 
             const label = document.createElement("span");
+            label.className = "moss-row-label";
             let text = item.caption || item.desc || `未命名 (${item.label || "object"})`;
             if (isExtreme) text = `[极小框 ${realW}x${realH}] ${text}`; // 显示真实尺寸
             
             label.textContent = `${index + 1}. ${text.length > 15 ? text.substring(0, 15) + "..." : text}`;
-            label.style.cssText = `color: ${isExtreme ? '#ff4a4a' : '#ccc'}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; pointer-events: none;`;
+            label.style.cssText = `color: ${isExtreme ? '#ff4a4a' : '#ccc'}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; pointer-events: none;`;
 
             // 🌟 锁定按钮
             const lockBtn = document.createElement("button");
@@ -2538,6 +3825,7 @@ function createFloatingPanel(node, jsonWidget) {
                 drawCanvas();
             };
 
+            row.appendChild(grip);
             row.appendChild(cb);
             row.appendChild(label);
             row.appendChild(lockBtn);
@@ -2580,9 +3868,10 @@ function createFloatingPanel(node, jsonWidget) {
             knownBboxHistory.add("-128,-128,128,128");
 
             isUpdatingFromUI = true;
-            jsonWidget.value = JSON.stringify(data, null, 2);
+            jsonWidget.value = serializeLayout(data);
             if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
             isUpdatingFromUI = false;
+            recordHistory(jsonWidget.value, false);
 
             selectedIndices.clear();
             selectedIndices.add(data.items.length - 1);
@@ -2609,9 +3898,10 @@ function createFloatingPanel(node, jsonWidget) {
             indicesToRemove.forEach((idx) => items.splice(idx, 1));
 
             isUpdatingFromUI = true;
-            jsonWidget.value = JSON.stringify(data, null, 2);
+            jsonWidget.value = serializeLayout(data);
             if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
             isUpdatingFromUI = false;
+            recordHistory(jsonWidget.value, false);
 
             selectedIndices.clear();
             activeIndex = -1;
@@ -2623,10 +3913,66 @@ function createFloatingPanel(node, jsonWidget) {
         }
     });
 
+    // 把草稿格式（abs/xyxy）就地转成模型格式（abs_centralized/yxyx），并同步画布尺寸。
+    // width / height 会保留在 JSON 里（模型格式也允许携带），只在生成提示词时剥离。
+    const normalizeJsonWidget = () => {
+        const wW = node.widgets?.find((x) => x.name === "canvas_width");
+        const hW = node.widgets?.find((x) => x.name === "canvas_height");
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonWidget.value || "{}");
+        } catch (_) {
+            return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+
+        const res = normalizeLayoutSchema(parsed, wW?.value, hW?.value);
+
+        // JSON 自带画布尺寸时，以它为准同步到节点控件
+        if (res.width && wW && wW.value !== res.width) {
+            wW.value = res.width;
+            wW.callback?.(wW.value);
+        }
+        if (res.height && hW && hW.value !== res.height) {
+            hW.value = res.height;
+            hW.callback?.(hW.value);
+        }
+
+        if (!res.converted) return;
+
+        isUpdatingFromUI = true;
+        jsonWidget.value = serializeLayout(parsed);
+        jsonWidget.callback?.(jsonWidget.value); // 只刷新控件显示，不触发 renderList
+        isUpdatingFromUI = false;
+        console.log("[MOSS] 已把草稿格式(abs/xyxy)转换为模型格式(abs_centralized/yxyx)");
+    };
+
+    // 画布控件变化时，把 JSON 里已有的 width / height 同步过去（不主动新增字段）
+    const syncCanvasSizeToJson = (key, value) => {
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonWidget.value || "{}");
+        } catch (_) {
+            return;
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+        if (!(key in parsed)) return;
+        const num = Number(value);
+        if (!Number.isFinite(num) || Number(parsed[key]) === num) return;
+        parsed[key] = num;
+        isUpdatingFromUI = true;
+        jsonWidget.value = serializeLayout(parsed);
+        jsonWidget.callback?.(jsonWidget.value);
+        isUpdatingFromUI = false;
+    };
+
     const origCallback = jsonWidget.callback;
     jsonWidget.callback = function () {
         if (origCallback) origCallback.apply(this, arguments);
-        if (!isUpdatingFromUI) renderList();
+        if (isUpdatingFromUI) return;
+        normalizeJsonWidget();
+        recordHistory(jsonWidget.value); // 手动改 JSON 也进撤销栈（连续输入会合并）
+        renderList();
     };
 
     const wWidget = node.widgets.find((w) => w.name === "canvas_width");
@@ -2636,10 +3982,12 @@ function createFloatingPanel(node, jsonWidget) {
             origHCb = hWidget.callback;
         wWidget.callback = function () {
             if (origWCb) origWCb.apply(this, arguments);
+            syncCanvasSizeToJson("width", wWidget.value);
             drawCanvas();
         };
         hWidget.callback = function () {
             if (origHCb) origHCb.apply(this, arguments);
+            syncCanvasSizeToJson("height", hWidget.value);
             drawCanvas();
         };
     }
@@ -2663,14 +4011,16 @@ function createFloatingPanel(node, jsonWidget) {
             <div style="margin-bottom: 10px;"><b style="color:#fff;">⌨️ 快捷键：</b></div>
             <ul style="margin: 0 0 10px 20px; padding: 0; color: #ccc;">
                 <li><b>Delete / Backspace</b>：删除选中框（或在操控模式下删除背景图）</li>
+                <li><b>方向键</b>：微移选中的框 1px；<b>Shift + 方向键</b>：按吸附步长移动</li>
+                <li><b>撤销 / 重做 / 重置视图</b>：画布右下角的 ↶ ↷ 🎯 按钮</li>
                 <li><b>Ctrl + V</b>：在画布聚焦时粘贴背景图</li>
                 <li><b>Ctrl + 点击</b>：多选框</li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">📐 极小框控制：</b></div>
             <ul style="margin: 0 0 10px 20px; padding: 0; color: #ccc;">
-                <li>当框小于 16x16 时，会在画布上显示为 16x16 的红色虚线框。</li>
-                <li>在右侧菜单勾选“极小框控制”，可自定义 1-15px 尺寸及对齐方式。</li>
+                <li>当框的宽或高小于当前网格尺寸（16 或 32）时，会在画布上显示为同样大小的红色虚线框。</li>
+                <li>在右侧菜单勾选“极小框控制”，可自定义 1 ~ (网格尺寸-1) px 的尺寸及对齐方式。</li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">🔒 锁定功能：</b></div>
@@ -2688,12 +4038,17 @@ function createFloatingPanel(node, jsonWidget) {
         modal.querySelector("#close-help-btn").onclick = () => modal.remove();
     };
 
+    normalizeJsonWidget(); // 打开面板时就把草稿格式转成模型格式
     renderList();
+    recordHistory(jsonWidget.value, false); // 撤销栈的初始状态
+    lastRecordAt = 0; // 保证首次编辑不会被合并进初始状态
 
     // 🌟 暴露刷新接口，供重新打开面板时调用
     node._mossRefreshPanel = () => {
         renderList();
     };
+
+    openPanelIds.add(node.id); // 记下来，节点被重建（如 Ctrl+Z）时可自动恢复
 
     // 🌟 消费 pending 背景图（放在函数末尾，此时 getCanvasSize / drawCanvas 等全部已初始化）
     if (node._mossPendingBackground) {
