@@ -88,6 +88,390 @@ function normalizeLayoutSchema(data, fallbackW, fallbackH) {
 }
 
 // ==========================================
+// 1.5 JSON 控件下方追加「复制」按钮
+// ==========================================
+// 这个版本的 ComfyUI 只渲染官方控件类型（自定义画布控件不会被绘制），
+// 所以这里用 addWidget("button")，并把它挪到 layout_json 的正下方。
+function attachJsonCopyButtons(node, jsonWidget) {
+    if (!jsonWidget) return;
+
+    const copyText = async (text) => {
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                return true;
+            }
+        } catch (_) {
+            /* 继续走回退方案 */
+        }
+        try {
+            const ta = document.createElement("textarea");
+            ta.value = text;
+            ta.style.cssText = "position:fixed; left:-9999px; top:0;";
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand("copy");
+            ta.remove();
+            return ok;
+        } catch (_) {
+            return false;
+        }
+    };
+
+    // 复制并带上画布宽高（放在最前面，便于阅读）
+    const jsonWithSize = () => {
+        const raw = jsonWidget.value || "";
+        let data;
+        try {
+            data = JSON.parse(raw);
+        } catch (_) {
+            return raw;
+        }
+        if (!data || typeof data !== "object" || Array.isArray(data)) return raw;
+
+        const w = node.widgets?.find((x) => x.name === "canvas_width")?.value;
+        const h = node.widgets?.find((x) => x.name === "canvas_height")?.value;
+        const ordered = {};
+        if (Number.isFinite(Number(w))) ordered.width = Number(w);
+        if (Number.isFinite(Number(h))) ordered.height = Number(h);
+        Object.keys(data).forEach((k) => {
+            if (k !== "width" && k !== "height") ordered[k] = data[k];
+        });
+        return JSON.stringify(ordered, null, 2);
+    };
+
+    // 把控件插到 layout_json 之后
+    const placeAfterJsonWidget = (w) => {
+        const arr = node.widgets || [];
+        const from = arr.indexOf(w);
+        if (from >= 0) arr.splice(from, 1);
+        const idx = arr.findIndex((x) => x.name === "layout_json");
+        if (idx >= 0) arr.splice(idx + 1, 0, w);
+        else arr.push(w);
+    };
+
+    // 官方整行按钮（可靠，但没有并排效果）
+    const addPlainButtons = () => {
+        const add = (label, run) => {
+            let w = null;
+            w = node.addWidget("button", label, null, async () => {
+                const ok = await run();
+                const shown = ok ? "✓ 已复制" : "✗ 失败";
+                w.label = shown;
+                w.name = shown;
+                node.setDirtyCanvas?.(true, true);
+                setTimeout(() => {
+                    w.label = label;
+                    w.name = label;
+                    node.setDirtyCanvas?.(true, true);
+                }, 1200);
+            });
+            placeAfterJsonWidget(w);
+            return w;
+        };
+        add("📐 复制 JSON(带长宽)", () => copyText(jsonWithSize()));
+        add("📋 复制 JSON", () => copyText(jsonWidget.value || ""));
+    };
+
+    // ---- 方案 A：DOM 控件（原生 hover / click，最可靠） ----
+    const DOM_ROW_H = 26;
+    const buildDomRow = () => {
+        const wrap = document.createElement("div");
+        // 固定行高：DOM 控件的高度会跟随元素，不固定就会被 stretch 拉满
+        wrap.style.cssText =
+            `display:flex; gap:6px; width:100%; box-sizing:border-box; height:${DOM_ROW_H}px; margin:0; padding:0; align-items:stretch;`;
+
+        const makeBtn = (label, handler) => {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.textContent = label;
+            b.style.cssText =
+                `flex:1 1 0; min-width:0; height:${DOM_ROW_H}px; margin:0; padding:0 6px; font-size:12px; line-height:1; ` +
+                "border-radius:4px; border:1px solid #555; background:#2e2e2e; color:#ccc; cursor:pointer; " +
+                "transition:background .12s,border-color .12s,color .12s;";
+            b.addEventListener("mouseenter", () => {
+                b.style.background = "#3c3c3c";
+                b.style.borderColor = "#8a8a8a";
+                b.style.color = "#fff";
+            });
+            b.addEventListener("mouseleave", () => {
+                b.style.background = "#2e2e2e";
+                b.style.borderColor = "#555";
+                b.style.color = "#ccc";
+            });
+            // 阻止拖拽节点 / 画布交互
+            b.addEventListener("pointerdown", (e) => e.stopPropagation());
+            b.addEventListener("click", async (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                const ok = await handler();
+                b.textContent = ok ? "✓ 已复制" : "✗ 失败";
+                setTimeout(() => {
+                    b.textContent = label;
+                }, 1200);
+            });
+            wrap.appendChild(b);
+            return b;
+        };
+
+        makeBtn("复制", () => copyText(jsonWidget.value || ""));
+        makeBtn("复制(带长宽)", () => copyText(jsonWithSize()));
+        return wrap;
+    };
+
+    // DOM 控件方案在这个前端会留一整行空白（行高由模板控制），先关闭
+    const ENABLE_DOM_ROW = false;
+    if (ENABLE_DOM_ROW && typeof node.addDOMWidget === "function") {
+        try {
+            const domWidget = node.addDOMWidget("moss_copy_row", "moss_copy", buildDomRow(), {
+                serialize: false,
+                getHeight: () => DOM_ROW_H,
+            });
+            if (domWidget) {
+                try {
+                    // 双保险：万一前端按 computeSize 排版，也固定成一行高度
+                    domWidget.computeSize = () => [Math.max(80, (node.size?.[0] || 320) - 20), DOM_ROW_H];
+                } catch (_) {
+                    /* 忽略 */
+                }
+                placeAfterJsonWidget(domWidget);
+
+                // 这一版前端把控件排进 CSS 子网格，行高由节点模板决定，不是元素高度。
+                // 先压元素，再切一次节点尺寸强制重排；若行高仍不收敛（>60px），
+                // 就直接撤掉 DOM 控件、换回官方整行按钮，避免留下大片空白。
+                setTimeout(() => {
+                    try {
+                        const el = domWidget.element;
+                        const host = el?.parentElement || null;
+                        if (el) {
+                            el.style.height = `${DOM_ROW_H}px`;
+                            el.style.minHeight = `${DOM_ROW_H}px`;
+                            el.style.maxHeight = `${DOM_ROW_H}px`;
+                        }
+                        if (host) {
+                            host.style.height = `${DOM_ROW_H}px`;
+                            host.style.minHeight = `${DOM_ROW_H}px`;
+                            host.style.maxHeight = `${DOM_ROW_H}px`;
+                            host.style.padding = "0";
+                            host.style.margin = "0";
+                        }
+
+                        // 有的版本会读 widget.height / options.getHeight 来排版
+                        try {
+                            domWidget.height = DOM_ROW_H;
+                            domWidget.options = domWidget.options || {};
+                            domWidget.options.getHeight = () => DOM_ROW_H;
+                        } catch (_) {
+                            /* 忽略 */
+                        }
+
+                        // 切一次尺寸，迫使前端按新的控件高度重算网格行
+                        try {
+                            const [w, h] = node.size;
+                            node.setSize([w, h + 1]);
+                            node.setSize([w, h]);
+                        } catch (_) {
+                            /* 忽略 */
+                        }
+                        node.graph?.setDirtyCanvas?.(true, true);
+                    } catch (_) {
+                        /* 忽略 */
+                    }
+
+                    // 二次确认：行高没收敛就换官方按钮
+                    setTimeout(() => {
+                        try {
+                            const el = domWidget.element;
+                            const rowEl =
+                                el?.closest?.('[data-testid="node-widget"]') || el?.parentElement?.parentElement;
+                            const rowH = rowEl ? rowEl.getBoundingClientRect().height : 0;
+                            if (rowH <= 60) return; // 收敛了，保留并排按钮
+
+                            const i = node.widgets.indexOf(domWidget);
+                            if (i >= 0) node.widgets.splice(i, 1);
+                            el?.remove?.();
+                            addPlainButtons();
+                            node.graph?.setDirtyCanvas?.(true, true);
+                        } catch (_) {
+                            /* 忽略 */
+                        }
+                    }, 320);
+                }, 120);
+
+                return; // DOM 版生效，下面的画布方案不再执行
+            }
+        } catch (err) {
+            console.warn("[MOSS] DOM 复制按钮添加失败，退回其它方案:", err);
+        }
+    }
+
+    // 该前端的控件行高由节点模板控制：DOM 控件会留下一整行空白，
+    // 自绘控件又没有鼠标事件。两条路都试过，统一退回官方按钮（无空白、可点击）。
+    addPlainButtons();
+    return;
+
+    /* eslint-disable no-unreachable */
+    const ROW_H = 22;
+    const BTN_H = 20;
+    const BTN_GAP = 4;
+
+    const runAction = async (id) => {
+        const text = id === "copySize" ? jsonWithSize() : (jsonWidget.value || "");
+        const ok = await copyText(text);
+        node._mossCopyFlash = { id, label: ok ? "✓ 已复制" : "✗ 失败" };
+        node.setDirtyCanvas?.(true, false);
+        setTimeout(() => {
+            node._mossCopyFlash = null;
+            node.setDirtyCanvas?.(true, false);
+        }, 1200);
+    };
+
+    const drawBtn = (ctx, x, y, w, h, label, hot) => {
+        ctx.beginPath();
+        if (typeof ctx.roundRect === "function") ctx.roundRect(x, y, w, h, 4);
+        else ctx.rect(x, y, w, h);
+        ctx.fillStyle = hot ? "#3c3c3c" : "#2e2e2e";
+        ctx.fill();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = hot ? "#8a8a8a" : "#555";
+        ctx.stroke();
+        ctx.fillStyle = hot ? "#ffffff" : "#c8c8c8";
+        ctx.font = "11px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(label, x + w / 2, y + h / 2 + 0.5);
+    };
+
+    // 不用 emoji：它的实际字宽和 measureText 不一致，会让文字看起来偏左
+    const LABEL_LEFT = "复制";
+    const LABEL_RIGHT = "复制(带长宽)";
+
+    const hitTestRects = (n, lx, ly) => {
+        for (const r of n._mossCopyRects || []) {
+            if (lx >= r.x && lx <= r.x + r.w && ly >= r.y && ly <= r.y + r.h) return r.id;
+        }
+        return null;
+    };
+
+    // widget.mouse 与 node.onMouseDown 可能都触发，去重
+    const trigger = (id) => {
+        const now = Date.now();
+        if (node._mossCopyLastAt && now - node._mossCopyLastAt < 250) return true;
+        node._mossCopyLastAt = now;
+        runAction(id);
+        return true;
+    };
+
+    // 命中检测：localPos 在不同版本里语义不一，两种坐标都试一遍
+    const hitId = (e, localPos, canvas, n) => {
+        const candidates = [];
+        if (Array.isArray(localPos) && localPos.length >= 2 && Number.isFinite(localPos[0])) {
+            candidates.push(localPos);
+        }
+        const cv = (canvas && canvas.canvas) || app.canvas?.canvas;
+        const ds = (canvas && canvas.ds) || app.canvas?.ds;
+        if (e && cv && ds && Number.isFinite(e.clientX)) {
+            const rect = cv.getBoundingClientRect();
+            const scale = ds.scale || 1;
+            candidates.push([
+                (e.clientX - rect.left) / scale - ds.offset[0] - n.pos[0],
+                (e.clientY - rect.top) / scale - ds.offset[1] - n.pos[1],
+            ]);
+        }
+        for (const p of candidates) {
+            const id = hitTestRects(n, p[0], p[1]);
+            if (id) return id;
+        }
+        return null;
+    };
+
+    // 一行两个半宽按钮：横排
+    const widget = {
+        name: "moss_json_copy",
+        type: "moss_json_copy",
+        value: null,
+        options: {},
+        last_y: 0,
+        computeSize: () => [0, ROW_H],
+        draw(ctx, n, width, y) {
+            n._mossCopyDrawn = true; // 供兜底逻辑判断是否真的被绘制
+            const total = (typeof width === "number" && width > 0 ? width : n.size[0]) || 200;
+            const w = Math.max(40, (total - BTN_GAP) / 2);
+            const flash = n._mossCopyFlash;
+            const hover = n._mossCopyHover;
+
+            const labelOf = (id, fallback) => (flash && flash.id === id ? flash.label : fallback);
+            const isHot = (id) => (flash && flash.id === id) || hover === id;
+
+            n._mossCopyRects = [
+                { x: 0, y, w, h: BTN_H, id: "copy" },
+                { x: w + BTN_GAP, y, w, h: BTN_H, id: "copySize" },
+            ];
+
+            ctx.save();
+            drawBtn(ctx, 0, y, w, BTN_H, labelOf("copy", LABEL_LEFT), isHot("copy"));
+            drawBtn(ctx, w + BTN_GAP, y, w, BTN_H, labelOf("copySize", LABEL_RIGHT), isHot("copySize"));
+            ctx.restore();
+        },
+        mouse(e, pos, n) {
+            if (!e || !pos) return false;
+            const type = e.type || "";
+            if (type !== "pointerdown" && type !== "mousedown" && type !== "click") return false;
+            const id = hitTestRects(n, pos[0], pos[1]);
+            return id ? trigger(id) : false;
+        },
+    };
+
+    // 悬停高亮 + 点击兜底（部分前端不派发 widget.mouse）
+    const origMove = node.onMouseMove;
+    node.onMouseMove = function (e, localPos, canvas) {
+        const res = origMove?.apply(this, arguments);
+        const id = hitId(e, localPos, canvas, this);
+        if (id !== this._mossCopyHover) {
+            this._mossCopyHover = id;
+            this.setDirtyCanvas?.(true, false);
+        }
+        return res;
+    };
+
+    const origDown = node.onMouseDown;
+    node.onMouseDown = function (e, localPos, canvas) {
+        const id = hitId(e, localPos, canvas, this);
+        if (id) return trigger(id);
+        return origDown?.apply(this, arguments);
+    };
+
+    let customAdded = false;
+    try {
+        if (typeof node.addCustomWidget === "function") {
+            node.addCustomWidget(widget);
+            placeAfterJsonWidget(widget);
+            customAdded = true;
+        }
+    } catch (err) {
+        console.warn("[MOSS] 自定义复制按钮添加失败，改用普通按钮:", err);
+    }
+
+    // 兜底：不绘制自定义控件（或 addCustomWidget 不可用）时，退回官方整行按钮
+    const addFallbackButtons = () => {
+        if (node._mossCopyFallback) return;
+        node._mossCopyFallback = true;
+        const i = node.widgets.indexOf(widget);
+        if (i >= 0) node.widgets.splice(i, 1);
+        addPlainButtons();
+        node.setDirtyCanvas?.(true, true);
+    };
+
+    if (!customAdded) {
+        addFallbackButtons();
+    } else {
+        setTimeout(() => {
+            if (!node._mossCopyDrawn) addFallbackButtons();
+        }, 1200);
+    }
+}
+
+// ==========================================
 // 1. MOSS_JSON_Importer 的快捷编辑功能
 // ==========================================
 app.registerExtension({
@@ -361,6 +745,9 @@ app.registerExtension({
             node.addWidget("button", "📋 打开边界框管理面板", null, () => {
                 createFloatingPanel(node, jsonWidget);
             });
+
+            // 🌟 JSON 控件下方的「复制 / 复制(带长宽)」按钮
+            attachJsonCopyButtons(node, jsonWidget);
 
             // 🌟 节点被重建（例如 Ctrl+Z 触发整图 reconfigure）后自动恢复面板
             if (openPanelIds.has(node.id)) {
