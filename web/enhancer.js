@@ -1534,6 +1534,13 @@ function createFloatingPanel(node, jsonWidget) {
     let isPanelDetached = false;
     let detachedPos = { x: 0, y: 0 };
 
+    // 画布右下角工具条要避让「吸附在底部」的属性面板；面板悬浮时它不该被顶上去
+    const updateCanvasToolbarOffset = () => {
+        if (!canvasTools) return;
+        const dockedVisible = editorContainer.style.display !== "none" && !isPanelDetached;
+        canvasTools.style.bottom = dockedVisible ? `${editorContainer.offsetHeight + 12}px` : "12px";
+    };
+
     const setDetached = (detached) => {
         if (detached === isPanelDetached) return;
         const wasVisible = editorContainer.style.display !== "none";
@@ -1565,6 +1572,7 @@ function createFloatingPanel(node, jsonWidget) {
         }
 
         if (wasVisible) editorContainer.style.display = "flex";
+        updateCanvasToolbarOffset();
     };
 
     const toggleDetached = () => {
@@ -2403,7 +2411,7 @@ function createFloatingPanel(node, jsonWidget) {
             editorContainer.style.display = "none";
             closeColorPopup(false);
             // 属性面板收起时，右下角工具条回到画布底部
-            if (canvasTools) canvasTools.style.bottom = "12px";
+            updateCanvasToolbarOffset();
             return;
         }
         editorContainer.style.display = "flex";
@@ -2449,11 +2457,8 @@ function createFloatingPanel(node, jsonWidget) {
         // 标签区整体重建（选中态 / 编辑态都在 renderTags 里处理）
         renderTags();
 
-        // 属性面板展开时会盖住画布底部，把右下角工具条顶上去
-        if (canvasTools) {
-            const h = isPanelDetached ? 0 : editorContainer.offsetHeight;
-            canvasTools.style.bottom = `${h + 12}px`;
-        }
+        // 属性面板展开时会盖住画布底部，把右下角工具条顶上去（悬浮态则不需要）
+        updateCanvasToolbarOffset();
     };
 
     const setItemLabel = (label) => {
