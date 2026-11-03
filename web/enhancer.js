@@ -960,6 +960,14 @@ function createFloatingPanel(node, jsonWidget) {
     let bgInitialState = null;
     let bgSource = "none"; // 'manual' | 'auto'
 
+    // 拖动背景图时是否吸附画布边缘/中心（面板里的“吸附”勾选框控制）
+    let bgSnap = true;
+    // 锁定长宽比：输入尺寸、拖拽边角都按比例同步
+    let bgLockRatio = true;
+
+    // 面板里的“尺寸”输入框建好后挂上来（避免上面的函数提前引用导致 TDZ）
+    let syncBgSizeHook = null;
+
     // 🌟 新增：记录所有历史存在过的框的坐标，用于精准识别新建框
     const knownBboxHistory = new Set(); 
 
@@ -977,6 +985,7 @@ function createFloatingPanel(node, jsonWidget) {
             bgActiveCb.checked = false;
             bgActiveCb.disabled = true;
         }
+        if (syncBgSizeHook) syncBgSizeHook();
         if (bgUploadInput) bgUploadInput.value = ""; 
         drawCanvas();
     }
@@ -986,21 +995,14 @@ function createFloatingPanel(node, jsonWidget) {
         bgImage = img;
         bgSource = source;
 
-        let w, h;
-        try {
-            ({ w, h } = getCanvasSize());
-        } catch (_) {
-            w = node.widgets?.find((x) => x.name === "canvas_width")?.value || 1024;
-            h = node.widgets?.find((x) => x.name === "canvas_height")?.value || 1024;
-        }
-
-        const scale = Math.max(w / img.width, h / img.height);
-        bgW = img.width * scale;
-        bgH = img.height * scale;
+        // 导入时使用原图尺寸（1:1 像素），需要铺满时点「⤢ 铺满」
+        bgW = img.width;
+        bgH = img.height;
         bgX = 0;
         bgY = 0;
         bgInitialState = { x: bgX, y: bgY, w: bgW, h: bgH };
         if (bgActiveCb) bgActiveCb.disabled = false;
+        if (syncBgSizeHook) syncBgSizeHook();
         if (typeof drawCanvas === "function") drawCanvas();
     }
 
@@ -2225,18 +2227,36 @@ function createFloatingPanel(node, jsonWidget) {
         }
         const item = currentItems[activeIndex];
         const oldBounds = getVisualBounds(item);
-        
-        let size = enableSmallCb.checked
-            ? (parseInt(sizeInput.value) || Math.round(GRID_SNAP / 2))
-            : GRID_SNAP;
-        size = Math.max(1, Math.min(enableSmallCb.checked ? GRID_SNAP - 1 : GRID_SNAP, size));
-        
-        const finalXmin = Math.round((oldBounds.vXmin + oldBounds.vXmax) / 2 - size / 2);
-        const finalYmin = Math.round((oldBounds.vYmin + oldBounds.vYmax) / 2 - size / 2);
-        
-        item.bbox = [finalYmin, finalXmin, finalYmin + size, finalXmin + size];
-        if (!enableSmallCb.checked) item._align = "center";
-        
+        const cx = (oldBounds.vXmin + oldBounds.vXmax) / 2;
+        const cy = (oldBounds.vYmin + oldBounds.vYmax) / 2;
+
+        let w;
+        let h;
+
+        if (enableSmallCb.checked) {
+            // 进入极小框：先记住原来的尺寸，取消勾选时还原
+            if (!oldBounds.isExtreme) item._prevBBox = [...item.bbox];
+            let size = parseInt(sizeInput.value) || Math.round(GRID_SNAP / 2);
+            size = Math.max(1, Math.min(GRID_SNAP - 1, size));
+            w = size;
+            h = size;
+        } else {
+            // 取消勾选：回到原来的尺寸；没有记录（比如本来就很小）才退回网格大小
+            if (Array.isArray(item._prevBBox) && item._prevBBox.length === 4) {
+                w = Math.max(1, item._prevBBox[3] - item._prevBBox[1]);
+                h = Math.max(1, item._prevBBox[2] - item._prevBBox[0]);
+                delete item._prevBBox;
+            } else {
+                w = GRID_SNAP;
+                h = GRID_SNAP;
+            }
+            item._align = "center";
+        }
+
+        const finalXmin = Math.round(cx - w / 2);
+        const finalYmin = Math.round(cy - h / 2);
+        item.bbox = [finalYmin, finalXmin, finalYmin + h, finalXmin + w];
+
         saveEditorChanges();
         renderList(false);
         drawCanvas();
@@ -2267,10 +2287,61 @@ function createFloatingPanel(node, jsonWidget) {
     bgPanel.style.cssText = "margin: 8px 10px 0; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
     
     // 添加区域标题
-    const bgTitle = document.createElement("div");
+    // 标题行：标题 + 操控 + 折叠按钮
+    const bgHeader = document.createElement("div");
+    bgHeader.style.cssText =
+        "display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: bold; color: #aaa;" +
+        "border-bottom: 1px solid #333; padding-bottom: 4px; margin-bottom: 2px;";
+
+    const bgTitle = document.createElement("span");
     bgTitle.textContent = "🖼️ 背景图设置";
-    bgTitle.style.cssText = "font-size: 12px; font-weight: bold; color: #aaa; border-bottom: 1px solid #333; padding-bottom: 4px; margin-bottom: 2px;";
-    bgPanel.appendChild(bgTitle);
+    bgTitle.style.cssText = "flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
+
+    const bgActiveLabel = document.createElement("label");
+    bgActiveLabel.style.cssText =
+        "display: flex; align-items: center; gap: 3px; color: #ccc; font-size: 12px; font-weight: normal; cursor: pointer; flex-shrink: 0;";
+    bgActiveLabel.title = "开启后可在画布上移动 / 拉伸背景图";
+    const bgActiveCb = document.createElement("input");
+    bgActiveCb.type = "checkbox";
+    bgActiveCb.disabled = true;
+    bgActiveCb.style.cssText = "accent-color: #4a9eff; margin: 0;";
+    bgActiveCb.onchange = () => { bgActive = bgActiveCb.checked; };
+    bgActiveLabel.appendChild(bgActiveCb);
+    bgActiveLabel.appendChild(document.createTextNode("操控"));
+
+    const bgCollapseBtn = document.createElement("button");
+    bgCollapseBtn.type = "button";
+    bgCollapseBtn.title = "展开 / 收起背景图设置";
+    bgCollapseBtn.style.cssText =
+        "display: flex; align-items: center; justify-content: center; flex: 0 0 auto;" +
+        "width: 22px; height: 20px; padding: 0; border-radius: 4px; background: #2a2a2a;" +
+        "border: 1px solid #444; cursor: pointer;";
+    // 用 CSS 三角形，比 ▾ 字符大好控制
+    const bgCollapseArrow = document.createElement("span");
+    bgCollapseArrow.style.cssText =
+        "display: block; width: 0; height: 0; border-left: 5px solid transparent;" +
+        "border-right: 5px solid transparent; border-top: 6px solid #bbb;" +
+        "transition: transform 0.15s;";
+    bgCollapseBtn.appendChild(bgCollapseArrow);
+    bgCollapseBtn.onmouseover = () => { bgCollapseBtn.style.background = "#3a3a3a"; };
+    bgCollapseBtn.onmouseout = () => { bgCollapseBtn.style.background = "#2a2a2a"; };
+
+    bgHeader.appendChild(bgTitle);
+    bgHeader.appendChild(bgActiveLabel);
+    bgHeader.appendChild(bgCollapseBtn);
+    bgPanel.appendChild(bgHeader);
+
+    // 正文容器（可折叠）
+    const bgBody = document.createElement("div");
+    bgBody.style.cssText = "display: flex; flex-direction: column; gap: 8px;";
+    bgPanel.appendChild(bgBody);
+
+    bgCollapseBtn.onclick = () => {
+        const collapsed = bgBody.style.display === "none";
+        bgBody.style.display = collapsed ? "flex" : "none";
+        // 展开时箭头朝下，收起时朝右
+        bgCollapseArrow.style.transform = collapsed ? "rotate(0deg)" : "rotate(-90deg)";
+    };
 
     const bgUploadLabel = document.createElement("label");
     bgUploadLabel.style.cssText = "background: #333; color: #ccc; text-align: center; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; border: 1px solid #555; flex: 1; transition: 0.2s;";
@@ -2320,7 +2391,7 @@ function createFloatingPanel(node, jsonWidget) {
     bgUploadRow.style.cssText = "display: flex; gap: 6px;";
     bgUploadRow.appendChild(bgUploadLabel);
     bgUploadRow.appendChild(bgPasteBtn);
-    bgPanel.appendChild(bgUploadRow);
+    bgBody.appendChild(bgUploadRow);
 
     const bgControlRow = document.createElement("div");
     bgControlRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px;";
@@ -2341,20 +2412,143 @@ function createFloatingPanel(node, jsonWidget) {
     
     bgControlRow.appendChild(bgOpacityLabel);
     bgControlRow.appendChild(bgOpacitySlider);
-    bgPanel.appendChild(bgControlRow);
+    bgBody.appendChild(bgControlRow);
+
+    // 🌟 背景图尺寸（没有背景图时禁用变灰）
+    const bgSizeRow = document.createElement("div");
+    bgSizeRow.style.cssText = "display: flex; align-items: center; gap: 5px; font-size: 12px;";
+
+    const bgSizeLabel = document.createElement("span");
+    bgSizeLabel.textContent = "尺寸";
+    bgSizeLabel.style.cssText = "color: #aaa; white-space: nowrap;";
+
+    const mkSizeInput = (ph) => {
+        const inp = document.createElement("input");
+        inp.type = "number";
+        inp.min = "16";
+        inp.step = "1";
+        inp.disabled = true;
+        inp.placeholder = ph;
+        inp.style.cssText =
+            "width: 58px; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; " +
+            "padding: 2px 4px; text-align: center; outline: none; box-sizing: border-box; transition: opacity 0.12s;";
+        return inp;
+    };
+    const bgWInput = mkSizeInput("宽");
+    const bgHInput = mkSizeInput("高");
+    const bgSizeX = document.createElement("span");
+    bgSizeX.textContent = "×";
+    bgSizeX.style.cssText = "color: #666;";
+
+    // 🌟 锁定长宽比
+    const bgLockBtn = document.createElement("button");
+    bgLockBtn.type = "button";
+    bgLockBtn.textContent = bgLockRatio ? "🔒" : "🔓";
+    bgLockBtn.title = bgLockRatio ? "已锁定长宽比（点按解锁）" : "未锁定长宽比（点按锁定）";
+    bgLockBtn.style.cssText =
+        "flex: 0 0 auto; width: 24px; height: 22px; line-height: 1; padding: 0; border-radius: 4px;" +
+        `background: #2a2a2a; border: 1px solid ${bgLockRatio ? "#4a9eff" : "#555"};` +
+        `color: ${bgLockRatio ? "#8ecbff" : "#ccc"}; font-size: 12px; cursor: pointer;`;
+    bgLockBtn.onclick = () => {
+        bgLockRatio = !bgLockRatio;
+        bgLockBtn.textContent = bgLockRatio ? "🔒" : "🔓";
+        bgLockBtn.title = bgLockRatio ? "已锁定长宽比（点按解锁）" : "未锁定长宽比（点按锁定）";
+        bgLockBtn.style.borderColor = bgLockRatio ? "#4a9eff" : "#555";
+        bgLockBtn.style.color = bgLockRatio ? "#8ecbff" : "#ccc";
+    };
+
+    // 🌟 铺满：按原图比例放大到盖住画布并居中
+    const bgCoverBtn = document.createElement("button");
+    bgCoverBtn.type = "button";
+    bgCoverBtn.textContent = "⤢ 铺满";
+    bgCoverBtn.title = "按原图比例放大到铺满画布并居中";
+    bgCoverBtn.disabled = true;
+    bgCoverBtn.style.cssText =
+        "background:#333;color:#ccc;border:1px solid #555;padding:2px 6px;border-radius:4px;" +
+        "cursor:pointer;font-size:11px;white-space:nowrap;transition:background 0.12s,opacity 0.12s;";
+    bgCoverBtn.onmouseover = () => {
+        if (!bgCoverBtn.disabled) bgCoverBtn.style.background = "#3f3f3f";
+    };
+    bgCoverBtn.onmouseout = () => {
+        bgCoverBtn.style.background = "#333";
+    };
+    bgCoverBtn.onclick = () => {
+        if (!bgImage) return;
+        const { w, h } = getCanvasSize();
+        const scale = Math.max(w / bgImage.width, h / bgImage.height);
+        bgW = bgImage.width * scale;
+        bgH = bgImage.height * scale;
+        bgX = 0;
+        bgY = 0;
+        if (syncBgSizeHook) syncBgSizeHook();
+        drawCanvas();
+    };
+
+    bgSizeRow.appendChild(bgSizeLabel);
+    bgSizeRow.appendChild(bgWInput);
+    bgSizeRow.appendChild(bgSizeX);
+    bgSizeRow.appendChild(bgHInput);
+    bgSizeRow.appendChild(bgLockBtn);
+    bgSizeRow.appendChild(bgCoverBtn);
+    bgBody.appendChild(bgSizeRow);
+
+    const syncBgSizeInputs = () => {
+        const has = !!bgImage;
+        [bgWInput, bgHInput].forEach((inp) => {
+            inp.disabled = !has;
+            inp.style.opacity = has ? "1" : "0.45";
+            inp.style.cursor = has ? "text" : "not-allowed";
+        });
+        bgCoverBtn.disabled = !has;
+        bgCoverBtn.style.opacity = has ? "1" : "0.45";
+        bgCoverBtn.style.cursor = has ? "pointer" : "not-allowed";
+        if (has) {
+            // 正在输入时不要覆盖
+            if (document.activeElement !== bgWInput) bgWInput.value = String(Math.round(bgW));
+            if (document.activeElement !== bgHInput) bgHInput.value = String(Math.round(bgH));
+        } else {
+            bgWInput.value = "";
+            bgHInput.value = "";
+        }
+    };
+
+    const applyBgSizeFromInputs = (which) => {
+        if (!bgImage) return;
+        let w = Math.max(16, Math.round(Number(bgWInput.value) || bgW));
+        let h = Math.max(16, Math.round(Number(bgHInput.value) || bgH));
+
+        // 锁定长宽比时，改任意一边都按当前比例同步另一边
+        if (bgLockRatio && bgW > 0 && bgH > 0) {
+            const ratio = bgW / bgH;
+            if (which === "h") w = Math.max(16, Math.round(h * ratio));
+            else h = Math.max(16, Math.round(w / ratio));
+        }
+
+        bgW = w;
+        bgH = h;
+        bgWInput.value = String(w);
+        bgHInput.value = String(h);
+        drawCanvas();
+    };
+    bgWInput.addEventListener("change", () => applyBgSizeFromInputs("w"));
+    bgHInput.addEventListener("change", () => applyBgSizeFromInputs("h"));
+
+    syncBgSizeHook = syncBgSizeInputs;
+    syncBgSizeInputs();
 
     const bgActionRow = document.createElement("div");
     bgActionRow.style.cssText = "display: flex; align-items: center; justify-content: space-between; margin-top: 2px;";
     
-    const bgActiveLabel = document.createElement("label");
-    bgActiveLabel.style.cssText = "display: flex; align-items: center; gap: 4px; color: #ccc; font-size: 12px; cursor: pointer;";
-    const bgActiveCb = document.createElement("input");
-    bgActiveCb.type = "checkbox";
-    bgActiveCb.disabled = true;
-    bgActiveCb.style.cssText = "accent-color: #4a9eff; margin: 0;";
-    bgActiveCb.onchange = () => { bgActive = bgActiveCb.checked; };
-    bgActiveLabel.appendChild(bgActiveCb);
-    bgActiveLabel.appendChild(document.createTextNode("操控"));
+    const bgSnapLabel = document.createElement("label");
+    bgSnapLabel.style.cssText = "display: flex; align-items: center; gap: 4px; color: #ccc; font-size: 12px; cursor: pointer;";
+    bgSnapLabel.title = "勾选：拖动时吸附画布的上/下/左/右边缘与中心；取消：自由拖动";
+    const bgSnapCb = document.createElement("input");
+    bgSnapCb.type = "checkbox";
+    bgSnapCb.checked = bgSnap;
+    bgSnapCb.style.cssText = "accent-color: #4a9eff; margin: 0;";
+    bgSnapCb.onchange = () => { bgSnap = bgSnapCb.checked; };
+    bgSnapLabel.appendChild(bgSnapCb);
+    bgSnapLabel.appendChild(document.createTextNode("吸附"));
 
     const bgBtnGroup = document.createElement("div");
     bgBtnGroup.style.cssText = "display: flex; gap: 4px;";
@@ -2369,6 +2563,7 @@ function createFloatingPanel(node, jsonWidget) {
         bgY = bgInitialState.y;
         bgW = bgInitialState.w;
         bgH = bgInitialState.h;
+        if (syncBgSizeHook) syncBgSizeHook();
         drawCanvas();
     };
 
@@ -2394,9 +2589,9 @@ function createFloatingPanel(node, jsonWidget) {
     bgBtnGroup.appendChild(bgCenterBtn);
     bgBtnGroup.appendChild(bgDeleteBtn);
 
-    bgActionRow.appendChild(bgActiveLabel);
+    bgActionRow.appendChild(bgSnapLabel);
     bgActionRow.appendChild(bgBtnGroup);
-    bgPanel.appendChild(bgActionRow);
+    bgBody.appendChild(bgActionRow);
     rightContainer.appendChild(bgPanel);
 
     const listArea = document.createElement("div");
@@ -2684,6 +2879,8 @@ function createFloatingPanel(node, jsonWidget) {
             if (!src) return;
             if (src._align && !it._align) it._align = src._align;
             if (src._locked) it._locked = true;
+            // 极小框的“原尺寸”也要跨重绘保留，否则取消勾选时还原不回去
+            if (Array.isArray(src._prevBBox) && !it._prevBBox) it._prevBBox = [...src._prevBBox];
         });
     };
 
@@ -2967,14 +3164,9 @@ function createFloatingPanel(node, jsonWidget) {
         ctx.fillStyle = "#1a1a1a";
         ctx.fillRect(p1.x, p1.y, canvasW_phys, canvasH_phys);
 
-        // 🌟 渲染背景图
+        // 🌟 渲染背景图（不裁剪到逻辑画布内：否则超出部分和四角控制点会被剪掉，没法拉伸）
         if (bgImage) {
             ctx.save();
-            // 剪裁到画布范围内
-            ctx.beginPath();
-            ctx.rect(p1.x, p1.y, canvasW_phys, canvasH_phys);
-            ctx.clip();
-
             ctx.globalAlpha = bgOpacity;
             const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
             const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
@@ -3247,6 +3439,36 @@ function createFloatingPanel(node, jsonWidget) {
         { passive: false },
     );
 
+    // 背景图命中检测（操控模式）：返回 "tl"/"tr"/"bl"/"br"/"t"/"b"/"l"/"r"/"move"/null
+    const getBgHitMode = (mouseX, mouseY) => {
+        if (!bgActive || !bgImage) return null;
+        const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
+        const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
+        // 拉伸点可能在画布外的黑色区域，容差放宽一点
+        const handleDist = 18;
+
+        const nearTL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
+        const nearTR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
+        const nearBL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
+        const nearBR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
+
+        const nearT = !nearTL && !nearTR && mouseY > bp1.y - handleDist && mouseY < bp1.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
+        const nearB = !nearBL && !nearBR && mouseY > bp2.y - handleDist && mouseY < bp2.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
+        const nearL = !nearTL && !nearBL && mouseX > bp1.x - handleDist && mouseX < bp1.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
+        const nearR = !nearTR && !nearBR && mouseX > bp2.x - handleDist && mouseX < bp2.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
+
+        if (nearTL) return "tl";
+        if (nearTR) return "tr";
+        if (nearBL) return "bl";
+        if (nearBR) return "br";
+        if (nearT) return "t";
+        if (nearB) return "b";
+        if (nearL) return "l";
+        if (nearR) return "r";
+        if (mouseX > bp1.x && mouseX < bp2.x && mouseY > bp1.y && mouseY < bp2.y) return "move";
+        return null;
+    };
+
     canvas.addEventListener("mousedown", (e) => {
         canvas.focus();
         const rect = canvasContainer.getBoundingClientRect();
@@ -3268,33 +3490,42 @@ function createFloatingPanel(node, jsonWidget) {
 
         // 🌟 背景图操控拦截
         if (bgActive && bgImage) {
-            const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
-            const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
-            const handleDist = 15;
-
-            const nearTL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
-            const nearTR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
-            const nearBL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
-            const nearBR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
-
-            const nearT = !nearTL && !nearTR && mouseY > bp1.y - handleDist && mouseY < bp1.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
-            const nearB = !nearBL && !nearBR && mouseY > bp2.y - handleDist && mouseY < bp2.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
-            const nearL = !nearTL && !nearBL && mouseX > bp1.x - handleDist && mouseX < bp1.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
-            const nearR = !nearTR && !nearBR && mouseX > bp2.x - handleDist && mouseX < bp2.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
-
-            let hitMode = null;
-            if (nearTL) hitMode = "tl"; else if (nearTR) hitMode = "tr";
-            else if (nearBL) hitMode = "bl"; else if (nearBR) hitMode = "br";
-            else if (nearT) hitMode = "t"; else if (nearB) hitMode = "b";
-            else if (nearL) hitMode = "l"; else if (nearR) hitMode = "r";
-            else if (mouseX > bp1.x && mouseX < bp2.x && mouseY > bp1.y && mouseY < bp2.y) hitMode = "move";
-
+            const hitMode = getBgHitMode(mouseX, mouseY);
             if (hitMode) {
                 bgDragMode = hitMode;
                 bgStartMouse = { x: mouseX, y: mouseY };
                 bgStartBBox = { x: bgX, y: bgY, w: bgW, h: bgH };
                 e.preventDefault();
                 return; // 阻断后续的 bbox 逻辑
+            }
+
+            // 操控模式下点在空白处：既不新建框，也不平移画布。
+            // 否则画布黑色区域里的背景图拉伸点会被“平移画布”的逻辑抢走。
+            e.preventDefault();
+            return;
+        }
+
+        // 🌟 画布外的黑色区域：左键拖动改为平移画布，不创建新框
+        {
+            const { w: cw, h: ch } = getCanvasSize();
+            const tl = logicToPhys(-cw / 2, -ch / 2);
+            const br = logicToPhys(cw / 2, ch / 2);
+            const insideCanvas =
+                mouseX >= tl.x && mouseX <= br.x && mouseY >= tl.y && mouseY <= br.y;
+
+            if (!insideCanvas) {
+                // 只有当这里本来会“新建框”时才改成平移，避免抢走框/标签的拖拽
+                const preHit = getHitInfo(mouseX, mouseY);
+                if (preHit.type === "create") {
+                    isPanning = true;
+                    panStartX = mouseX;
+                    panStartY = mouseY;
+                    panStartViewX = viewX;
+                    panStartViewY = viewY;
+                    canvas.style.cursor = "grabbing";
+                    e.preventDefault();
+                    return;
+                }
             }
         }
 
@@ -3409,24 +3640,108 @@ function createFloatingPanel(node, jsonWidget) {
             if (bgDragMode === "move") {
                 nx += dx;
                 ny += dy;
+
+                // 🌟 吸附到画布：左/中/右、上/中/下（仅在勾选“吸附”时生效）
+                if (bgSnap) {
+                    const snapThreshold = 8 / getActualScale();
+                    const { w: canvasW, h: canvasH } = getCanvasSize();
+                    const xTargets = [-canvasW / 2, 0, canvasW / 2];
+                    const yTargets = [-canvasH / 2, 0, canvasH / 2];
+
+                    // 用三个锚点（起始边 / 中心 / 结束边）里最近的那个去吸附
+                    const snapAxis = (pos, size, targets) => {
+                        const anchors = [pos - size / 2, pos, pos + size / 2];
+                        let bestDelta = null;
+                        for (const a of anchors) {
+                            for (const t of targets) {
+                                const d = t - a;
+                                if (
+                                    Math.abs(d) <= snapThreshold &&
+                                    (bestDelta === null || Math.abs(d) < Math.abs(bestDelta))
+                                ) {
+                                    bestDelta = d;
+                                }
+                            }
+                        }
+                        return bestDelta === null ? pos : pos + bestDelta;
+                    };
+
+                    nx = snapAxis(nx, nw, xTargets);
+                    ny = snapAxis(ny, nh, yTargets);
+                }
             } else {
-                const aspectRatio = bgStartBBox.w / bgStartBBox.h;
+                const startL = bgStartBBox.x - bgStartBBox.w / 2;
+                const startR = bgStartBBox.x + bgStartBBox.w / 2;
+                const startT = bgStartBBox.y - bgStartBBox.h / 2;
+                const startB = bgStartBBox.y + bgStartBBox.h / 2;
 
-                if (bgDragMode.includes("l")) { nx += dx; nw -= dx; }
-                if (bgDragMode.includes("r")) { nw += dx; }
-                if (bgDragMode.includes("t")) { ny += dy; nh -= dy; }
-                if (bgDragMode.includes("b")) { nh += dy; }
+                let L = startL, R = startR, T = startT, B = startB;
+                if (bgDragMode.includes("l")) L = startL + dx;
+                if (bgDragMode.includes("r")) R = startR + dx;
+                if (bgDragMode.includes("t")) T = startT + dy;
+                if (bgDragMode.includes("b")) B = startB + dy;
 
-                // 如果带有角标（tl, tr, bl, br），保持长宽比
-                if (bgDragMode.length === 2) {
-                    if (bgDragMode.includes("l")) {
-                        nh = nw / aspectRatio;
-                        if (bgDragMode.includes("t")) ny = bgStartBBox.y + bgStartBBox.h - nh;
-                    } else {
-                        nh = nw / aspectRatio;
-                        if (bgDragMode.includes("t")) ny = bgStartBBox.y + bgStartBBox.h - nh;
+                // 🌟 吸附：拖动的这条边靠近画布边缘/中心时自动对齐（和平移吸附同一开关）
+                if (bgSnap) {
+                    const { w: canvasW, h: canvasH } = getCanvasSize();
+                    const snapThr = 8 / getActualScale();
+                    const xTargets = [-canvasW / 2, 0, canvasW / 2];
+                    const yTargets = [-canvasH / 2, 0, canvasH / 2];
+
+                    const snapEdge = (value, targets) => {
+                        let best = null;
+                        for (const t of targets) {
+                            const d = Math.abs(t - value);
+                            if (d <= snapThr && (best === null || d < Math.abs(best - value))) best = t;
+                        }
+                        return best === null ? value : best;
+                    };
+
+                    if (bgDragMode.includes("l")) L = snapEdge(L, xTargets);
+                    if (bgDragMode.includes("r")) R = snapEdge(R, xTargets);
+                    if (bgDragMode.includes("t")) T = snapEdge(T, yTargets);
+                    if (bgDragMode.includes("b")) B = snapEdge(B, yTargets);
+                }
+
+                let w = R - L;
+                let h = B - T;
+                const horiz = bgDragMode.includes("l") || bgDragMode.includes("r");
+                const vert = bgDragMode.includes("t") || bgDragMode.includes("b");
+
+                // 🌟 锁定长宽比：拖四条边也会按比例联动，不只是拖角
+                if (bgLockRatio && bgStartBBox.w > 0 && bgStartBBox.h > 0) {
+                    const aspect = bgStartBBox.w / bgStartBBox.h;
+
+                    if (horiz && vert) {
+                        // 角：以位移较大的一维为准
+                        if (Math.abs(w) >= Math.abs(h) * aspect) h = w / aspect;
+                        else w = h * aspect;
+                    } else if (horiz) {
+                        h = w / aspect;
+                    } else if (vert) {
+                        w = h * aspect;
+                    }
+
+                    // 固定未被拖拽的边，其余方向保持原中心
+                    if (bgDragMode.includes("l")) L = R - w;
+                    else if (bgDragMode.includes("r")) R = L + w;
+                    else {
+                        L = bgStartBBox.x - w / 2;
+                        R = bgStartBBox.x + w / 2;
+                    }
+
+                    if (bgDragMode.includes("t")) T = B - h;
+                    else if (bgDragMode.includes("b")) B = T + h;
+                    else {
+                        T = bgStartBBox.y - h / 2;
+                        B = bgStartBBox.y + h / 2;
                     }
                 }
+
+                nx = (L + R) / 2;
+                ny = (T + B) / 2;
+                nw = Math.abs(R - L);
+                nh = Math.abs(B - T);
             }
 
             if (nw > 10 && nh > 10) {
@@ -3526,7 +3841,11 @@ function createFloatingPanel(node, jsonWidget) {
     });
 
     window.addEventListener("mouseup", () => {
-        if (bgDragMode) { bgDragMode = null; return; }
+        if (bgDragMode) {
+            bgDragMode = null;
+            if (syncBgSizeHook) syncBgSizeHook(); // 拖动/拉伸结束后刷新尺寸输入框
+            return;
+        }
         if (isPanning) {
             isPanning = false;
             canvas.style.cursor = "default";
@@ -3668,23 +3987,27 @@ function createFloatingPanel(node, jsonWidget) {
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
-        // 寻找双击位置对应的最上层框
+        // 与单击保持一致：优先「当前选中的框」→ 数字标签 → 其他框。
+        // 之前这里只按序号从大到小扫，重叠时会把精确选中的小框顶掉。
         let targetIdx = -1;
-        for (let i = currentItems.length - 1; i >= 0; i--) {
-            const bbox = currentItems[i].bbox;
-            if (!bbox || bbox.length !== 4) continue;
-            const [ymin, xmin, ymax, xmax] = bbox;
-            const p1 = logicToPhys(xmin, ymin);
-            const p2 = logicToPhys(xmax, ymax);
 
-            if (
-                mouseX >= p1.x &&
-                mouseX <= p2.x &&
-                mouseY >= p1.y &&
-                mouseY <= p2.y
-            ) {
-                targetIdx = i;
-                break;
+        const hit = getHitInfo(mouseX, mouseY);
+        if (hit && typeof hit.index === "number" && currentItems[hit.index]) {
+            targetIdx = hit.index;
+        }
+
+        if (targetIdx === -1) {
+            for (let i = currentItems.length - 1; i >= 0; i--) {
+                const item = currentItems[i];
+                const bbox = item && item.bbox;
+                if (!bbox || bbox.length !== 4) continue;
+                const { vXmin, vYmin, vXmax, vYmax } = getVisualBounds(item);
+                const p1 = logicToPhys(vXmin, vYmin);
+                const p2 = logicToPhys(vXmax, vYmax);
+                if (mouseX >= p1.x && mouseX <= p2.x && mouseY >= p1.y && mouseY <= p2.y) {
+                    targetIdx = i;
+                    break;
+                }
             }
         }
 
@@ -3729,11 +4052,17 @@ function createFloatingPanel(node, jsonWidget) {
             inlineInput.select();
 
             // 保存逻辑
+            let inlineSaved = false;
             const saveInline = () => {
+                if (inlineSaved) return; // Enter 后移除元素会再触发 blur，避免重复保存
+                inlineSaved = true;
                 const newText = inlineInput.value.trim();
                 if (currentItems[targetIdx]) {
+                    const changed = (currentItems[targetIdx].caption || "") !== newText;
                     currentItems[targetIdx].caption = newText;
-                    saveEditorChanges(); // 同步到 JSON、右侧列表和下方面板
+                    saveEditorChanges(); // 同步到 JSON、右侧列表
+                    // 同步下方属性面板的「描述」输入框
+                    if (changed) syncEditorPanel();
                 }
                 if (inlineInput.parentNode)
                     inlineInput.parentNode.removeChild(inlineInput);
@@ -3741,6 +4070,12 @@ function createFloatingPanel(node, jsonWidget) {
 
             // 失焦保存
             inlineInput.addEventListener("blur", saveInline);
+
+            // 边打字边把内容同步到下方属性面板的「描述」
+            inlineInput.addEventListener("input", () => {
+                if (document.activeElement === descArea) return;
+                descArea.value = inlineInput.value;
+            });
 
             // 键盘快捷键
             inlineInput.addEventListener("keydown", (ev) => {
@@ -3750,8 +4085,10 @@ function createFloatingPanel(node, jsonWidget) {
                     saveInline();
                 } else if (ev.key === "Escape") {
                     ev.preventDefault();
+                    inlineSaved = true; // 放弃修改：别让 blur 再保存一次
                     if (inlineInput.parentNode)
                         inlineInput.parentNode.removeChild(inlineInput);
+                    syncEditorPanel(); // 把面板里的临时文本还原
                 }
             });
         }
@@ -3799,6 +4136,18 @@ function createFloatingPanel(node, jsonWidget) {
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
+        // 🌟 最高优先级：操控背景图时的光标（移动 / 拉伸），优先于框和黑色区域
+        if (bgActive && bgImage) {
+            const mode = getBgHitMode(mouseX, mouseY);
+            if (mode === "tl" || mode === "br") canvas.style.cursor = "nwse-resize";
+            else if (mode === "tr" || mode === "bl") canvas.style.cursor = "nesw-resize";
+            else if (mode === "t" || mode === "b") canvas.style.cursor = "ns-resize";
+            else if (mode === "l" || mode === "r") canvas.style.cursor = "ew-resize";
+            else if (mode === "move") canvas.style.cursor = "move";
+            else canvas.style.cursor = "default"; // 操控模式下空白处不建框、不平移
+            return;
+        }
+
         let hoveredLabel = false;
         for (let l of labelCache) {
             if (
@@ -3819,8 +4168,15 @@ function createFloatingPanel(node, jsonWidget) {
 
         const hit = getHitInfo(mouseX, mouseY);
 
-        if (hit.type === "create") canvas.style.cursor = "crosshair";
-        else if (hit.type === "move") canvas.style.cursor = "move";
+        if (hit.type === "create") {
+            // 画布外的黑色区域拖动是“平移”，光标也换成抓手
+            const { w: cw, h: ch } = getCanvasSize();
+            const tl = logicToPhys(-cw / 2, -ch / 2);
+            const br = logicToPhys(cw / 2, ch / 2);
+            const insideCanvas =
+                mouseX >= tl.x && mouseX <= br.x && mouseY >= tl.y && mouseY <= br.y;
+            canvas.style.cursor = insideCanvas ? "crosshair" : "grab";
+        } else if (hit.type === "move") canvas.style.cursor = "move";
         else if (hit.type === "resize-tl" || hit.type === "resize-br")
             canvas.style.cursor = "nwse-resize";
         else if (hit.type === "resize-tr" || hit.type === "resize-bl")
