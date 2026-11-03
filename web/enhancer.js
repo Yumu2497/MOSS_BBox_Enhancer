@@ -13,6 +13,8 @@ import { api } from "../../scripts/api.js";
 // ComfyUI 的全局撤销（Ctrl+Z）会重建整张图，节点被移除再新建，
 // 面板会跟着消失；靠这份记录在节点重建后自动把它恢复。
 const openPanelIds = new Set();
+// 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
+let bboxClipboard = [];
 
 function sanitizeItemForJson(item) {
     if (!item || typeof item !== "object") return item;
@@ -4093,6 +4095,128 @@ function createFloatingPanel(node, jsonWidget) {
             });
         }
     });
+
+    // 🌟 框的复制 / 粘贴（Ctrl+C / Ctrl+V）
+    const cloneItemForClipboard = (item) => {
+        const copy = JSON.parse(JSON.stringify(item));
+        Object.keys(copy).forEach((k) => {
+            if (k.startsWith("_")) delete copy[k];
+        });
+        return copy;
+    };
+
+    const copySelectedBoxes = () => {
+        const idxs = selectedIndices.size
+            ? Array.from(selectedIndices)
+            : activeIndex !== -1
+              ? [activeIndex]
+              : [];
+        if (!idxs.length) return false;
+        idxs.sort((a, b) => a - b);
+        bboxClipboard = idxs
+            .map((i) => currentItems[i])
+            .filter(Boolean)
+            .map(cloneItemForClipboard);
+        return bboxClipboard.length > 0;
+    };
+
+    const pasteBoxes = () => {
+        if (!bboxClipboard.length) return false;
+        const { w, h } = getCanvasSize();
+        const limitX = w / 2;
+        const limitY = h / 2;
+        const offset = 10; // 粘出来的框稍微错开，避免完全重叠看不见
+
+        const added = [];
+        bboxClipboard.forEach((src) => {
+            const clone = JSON.parse(JSON.stringify(src));
+            const bbox = Array.isArray(clone.bbox) ? clone.bbox : null;
+            if (!bbox || bbox.length !== 4) return;
+
+            const bw = bbox[3] - bbox[1];
+            const bh = bbox[2] - bbox[0];
+            const xmin = Math.max(-limitX, Math.min(bbox[1] + offset, limitX - bw));
+            const ymin = Math.max(-limitY, Math.min(bbox[0] + offset, limitY - bh));
+
+            clone.bbox = [ymin, xmin, ymin + bh, xmin + bw];
+            currentItems.push(clone);
+            added.push(currentItems.length - 1);
+        });
+
+        if (!added.length) return false;
+
+        activeIndex = added[added.length - 1];
+        selectedIndices.clear();
+        added.forEach((i) => selectedIndices.add(i));
+
+        saveEditorChanges();
+        renderList();
+        syncEditorPanel();
+        drawCanvas();
+        return true;
+    };
+
+    const isPanelOpen = () => {
+        if (!panel || !document.body.contains(panel)) return false;
+        return panel.style.display !== "none";
+    };
+
+    // 只在"面板内"或"画布聚焦"时接管快捷键，避免抢走 ComfyUI 自己的复制粘贴
+    const isOurContext = (target) => {
+        if (target === canvas || panel.contains(target)) return true;
+        const ae = document.activeElement;
+        return ae === canvas || (ae && panel.contains(ae));
+    };
+
+    const isTypingElsewhere = () => {
+        const ae = document.activeElement;
+        if (!ae) return false;
+        return (
+            ae.tagName === "INPUT" ||
+            ae.tagName === "TEXTAREA" ||
+            ae.tagName === "SELECT" ||
+            ae.isContentEditable
+        );
+    };
+
+    const onPanelCopyKeydown = (e) => {
+        if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+        if ((e.key || "").toLowerCase() !== "c") return;
+        if (!document.body.contains(panel)) {
+            window.removeEventListener("keydown", onPanelCopyKeydown, true);
+            return;
+        }
+        if (!isPanelOpen() || isTypingElsewhere()) return;
+        if (!isOurContext(e.target)) return;
+
+        if (copySelectedBoxes()) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    };
+    window.addEventListener("keydown", onPanelCopyKeydown, true);
+
+    const onPanelPaste = (e) => {
+        if (!document.body.contains(panel)) {
+            document.removeEventListener("paste", onPanelPaste, true);
+            return;
+        }
+        if (e.defaultPrevented || !isPanelOpen() || isTypingElsewhere()) return;
+        if (!isOurContext(e.target)) return;
+
+        // 剪贴板里是图片 → 交给背景图逻辑（canvas 的 paste 监听会处理）
+        const items = e.clipboardData?.items;
+        const hasImage = items
+            ? Array.from(items).some((it) => it.type && it.type.startsWith("image/"))
+            : false;
+        if (hasImage) return;
+
+        if (bboxClipboard.length && pasteBoxes()) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+    };
+    document.addEventListener("paste", onPanelPaste, true);
 
     canvas.addEventListener("keydown", (e) => {
         if (e.key === "Delete" || e.key === "Backspace") {
