@@ -2,6 +2,7 @@ import { serializeLayout, normalizeLayoutSchema } from "../core/json-schema.js";
 import { openPanelIds } from "../core/panel-registry.js";
 import { createEditorModel } from "./editor-model.js";
 import { createRibbon, openPopover, closePopover } from "./ribbon.js";
+import { createToast } from "./toast.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -206,9 +207,101 @@ export function createFloatingPanel(node, jsonWidget) {
     canvas.tabIndex = 0;
     canvasContainer.appendChild(canvas);
 
+    // 画布矩形与尺寸缓存：拖动时每帧读 getBoundingClientRect 会反复触发同步布局
+    let canvasRect = null;
+    let canvasCssW = 0;
+    let canvasCssH = 0;
+    let canvasDpr = 0;
+
+    const getCanvasRect = () => {
+        if (!canvasRect) canvasRect = canvasContainer.getBoundingClientRect();
+        return canvasRect;
+    };
+    const invalidateCanvasRect = () => {
+        canvasRect = null;
+    };
+
+    // ================= 左下角：当前选中框的坐标 =================
+    const coordHud = document.createElement("div");
+    coordHud.style.cssText =
+        "position: absolute; left: 10px; bottom: 10px; z-index: 18; display: none; " +
+        "padding: 4px 8px; border-radius: 5px; background: rgba(18, 18, 18, 0.78); " +
+        "border: 1px solid #3a3a3a; color: #b8b8b8; pointer-events: none; white-space: pre; " +
+        "font: 11px/1.55 ui-monospace, Consolas, monospace;";
+    canvasContainer.appendChild(coordHud);
+
+    // 画布顶部的文字提示：按住修饰键时常驻，快捷键操作后短暂弹出
+    const toast = createToast(canvasContainer);
+
+    // 属性面板停靠时会盖住画布下沿，读数需要抬高；
+    // offsetHeight 是强制布局的读操作，只在面板开合时算一次，不要放到每帧里
+    let hudOffset = 10;
+    let hudLastText = "";
+    let hudLastBottom = "";
+    let hudVisible = false;
+
+    const refreshHudOffset = () => {
+        let next = 10;
+        try {
+            const docked = editorContainer.style.display !== "none" && !isPanelDetached;
+            if (docked) next = editorContainer.offsetHeight + 10;
+        } catch (e) {
+            // 初始化时这些变量还没声明，保持默认位置
+        }
+        hudOffset = next;
+    };
+
+    const updateCoordHud = () => {
+        const index = model.active >= 0
+            ? model.active
+            : model.selection.size ? Math.min(...model.selection) : -1;
+        const item = index >= 0 ? model.items[index] : null;
+        const bbox = item && Array.isArray(item.bbox) ? item.bbox : null;
+        if (!bbox || bbox.length !== 4) {
+            if (hudVisible) {
+                coordHud.style.display = "none";
+                hudVisible = false;
+            }
+            return;
+        }
+
+        const [ymin, xmin, ymax, xmax] = bbox;
+        const { w, h } = getCanvasSize();
+        const x1 = Math.round(xmin + w / 2);
+        const y1 = Math.round(ymin + h / 2);
+        const x2 = Math.round(xmax + w / 2);
+        const y2 = Math.round(ymax + h / 2);
+
+        const text =
+            `左上  x ${x1}, y ${y1}, x ${x2}, y ${y2}\n` +
+            `中心  y ${ymin}, x ${xmin}, y ${ymax}, x ${xmax}`;
+        if (text !== hudLastText) {
+            coordHud.textContent = text;
+            hudLastText = text;
+        }
+
+        const bottom = `${hudOffset}px`;
+        if (bottom !== hudLastBottom) {
+            coordHud.style.bottom = bottom;
+            hudLastBottom = bottom;
+        }
+        if (!hudVisible) {
+            coordHud.style.display = "block";
+            hudVisible = true;
+        }
+    };
+
     // ================= 顶部工具条：撤销 / 重做 / 重置视图 =================
-    const undoBtn = ribbon.button("undo", "撤销", () => undoEdit());
-    const redoBtn = ribbon.button("redo", "重做", () => redoEdit());
+    const undoBtn = ribbon.button("undo", "撤销", () => {
+        if (!model.canUndo()) return;
+        undoEdit();
+        toast.show("已撤销", 1000);
+    });
+    const redoBtn = ribbon.button("redo", "重做", () => {
+        if (!model.canRedo()) return;
+        redoEdit();
+        toast.show("已重做", 1000);
+    });
     const resetViewBtn = ribbon.button("reset", "重置视图", () => {
         model.view.scale = 1.0;
         model.view.x = 0;
@@ -1096,6 +1189,8 @@ export function createFloatingPanel(node, jsonWidget) {
         }
 
         if (wasVisible) editorContainer.style.display = "flex";
+        refreshHudOffset();
+        updateCoordHud();
     };
 
     const toggleDetached = () => {
@@ -1985,8 +2080,22 @@ export function createFloatingPanel(node, jsonWidget) {
     updateAlignState();
 
     let dragMode = null;
+    let dragCtrlKey = false;
+    // 新建框的拉伸：起点是一个零尺寸的点，四个方向都可能拉，角要跟着鼠标方向变
+    let dragCreating = false;
+    // Alt 拖动：按下时只登记，真正产生位移后才复制，避免 Alt+单击凭空多出一个重叠框
+    let pendingCopyDrag = null;
+    let dragCopyMode = false;
+    let dragCopyCount = 0;
+    // 拖动起始时的 Alt 状态；Alt 已用于复制时不再兼任「临时关闭吸附」
+    let dragStartAlt = false;
+    // 框选：画布像素坐标的矩形，null 表示没有在框选
+    let marqueeRect = null;
+    let marqueeAdditive = false;
     let dragStartMouse = { x: 0, y: 0 };
     let dragStartBBox = [0, 0, 0, 0];
+    // 多选拖动：起始坐标快照，整组按同一位移移动
+    let dragStartGroup = [];
     let labelCache = [];
 
     // 视口状态
@@ -2007,7 +2116,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     const getBaseScale = () => {
         const { w, h } = getCanvasSize();
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const padding = 40;
         const displayW = Math.max(1, rect.width - padding);
         const displayH = Math.max(1, rect.height - padding);
@@ -2018,7 +2127,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     const physToLogic = (px, py) => {
         const scale = getActualScale();
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const centerX = rect.width / 2;
         const centerY = rect.height / 2;
         return {
@@ -2029,7 +2138,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     const logicToPhys = (lx, ly) => {
         const scale = getActualScale();
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const centerX = rect.width / 2;
         const centerY = rect.height / 2;
         return { x: centerX + model.view.x + lx * scale, y: centerY + model.view.y + ly * scale };
@@ -2370,7 +2479,10 @@ export function createFloatingPanel(node, jsonWidget) {
         else return;
         e.preventDefault();
         e.stopPropagation();
-        nudgeSelected(dx, dy);
+        if (nudgeSelected(dx, dy)) {
+            const sign = (n) => (n > 0 ? "+" + n : String(n));
+            toast.show(`微移 x ${sign(dx)}, y ${sign(dy)}`, 800);
+        }
     };
     window.addEventListener("keydown", panelKeyHandler, true);
     node._mossKeyHandler = panelKeyHandler; // 节点删除时在 onRemoved 里摘掉
@@ -2421,9 +2533,13 @@ export function createFloatingPanel(node, jsonWidget) {
         if (model.active === -1 || !model.items[model.active]) {
             editorContainer.style.display = "none";
             closeColorPopup(false);
+            refreshHudOffset();
+            updateCoordHud();
             return;
         }
         editorContainer.style.display = "flex";
+        refreshHudOffset();
+        updateCoordHud();
         const item = model.items[model.active];
         // 🌟 换了框就清掉上一个框残留的色块选中态（取色浮层也要跟着收起）
         if (selectedPaletteOwner !== model.active) {
@@ -2564,22 +2680,42 @@ export function createFloatingPanel(node, jsonWidget) {
         item.bbox = [Math.round(newYmin), Math.round(newXmin), Math.round(newYmax), Math.round(newXmax)];
     };
 
+    // 一帧最多重绘一次：高回报率鼠标一帧能发十几个 mousemove
+    let drawScheduled = false;
+    const requestDraw = () => {
+        if (drawScheduled) return;
+        drawScheduled = true;
+        requestAnimationFrame(() => {
+            drawScheduled = false;
+            drawCanvas();
+        });
+    };
+
     // --- 绘制画布 ---
     const drawCanvas = () => {
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         if (rect.width === 0 || rect.height === 0) return; // 面板隐藏时跳过
+
+        updateCoordHud();
 
         const ctx = canvas.getContext("2d");
         const { w, h } = getCanvasSize();
         const actualScale = getActualScale();
 
-        if (canvas.width !== rect.width || canvas.height !== rect.height) {
-            canvas.width = rect.width;
-            canvas.height = rect.height;
+        const dpr = window.devicePixelRatio || 1;
+        const cssW = Math.round(rect.width);
+        const cssH = Math.round(rect.height);
+        if (canvasCssW !== cssW || canvasCssH !== cssH || canvasDpr !== dpr) {
+            canvasCssW = cssW;
+            canvasCssH = cssH;
+            canvasDpr = dpr;
+            canvas.width = Math.round(cssW * dpr);
+            canvas.height = Math.round(cssH * dpr);
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         }
 
         ctx.fillStyle = "#111";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillRect(0, 0, cssW, cssH);
 
         const p1 = logicToPhys(-w / 2, -h / 2);
         const p2 = logicToPhys(w / 2, h / 2);
@@ -2870,9 +3006,27 @@ export function createFloatingPanel(node, jsonWidget) {
             });
             ctx.restore();
         }
+
+        if (marqueeRect) {
+            const x = Math.min(marqueeRect.x1, marqueeRect.x2);
+            const y = Math.min(marqueeRect.y1, marqueeRect.y2);
+            const w = Math.abs(marqueeRect.x2 - marqueeRect.x1);
+            const h = Math.abs(marqueeRect.y2 - marqueeRect.y1);
+            ctx.save();
+            ctx.fillStyle = "rgba(74, 158, 255, 0.12)";
+            ctx.strokeStyle = "#4a9eff";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 3]);
+            ctx.fillRect(x, y, w, h);
+            ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, Math.round(w), Math.round(h));
+            ctx.restore();
+        }
     };
 
-    const resizeObserver = new ResizeObserver(() => drawCanvas());
+    const resizeObserver = new ResizeObserver(() => {
+        invalidateCanvasRect();
+        drawCanvas();
+    });
     resizeObserver.observe(canvasContainer);
 
     // 🌟 画布聚焦时 Ctrl+V 粘贴图片为背景图
@@ -2884,6 +3038,7 @@ export function createFloatingPanel(node, jsonWidget) {
             if (item.type && item.type.startsWith("image/")) {
                 const blob = item.getAsFile();
                 if (blob && loadBackgroundFromBlob(blob)) {
+                    toast.show("已粘贴背景图");
                     e.preventDefault();
                     e.stopPropagation(); // 防止 ComfyUI 全局粘贴节点/图片
                     return;
@@ -2897,7 +3052,7 @@ export function createFloatingPanel(node, jsonWidget) {
         (e) => {
             e.preventDefault();
 
-            const rect = canvasContainer.getBoundingClientRect();
+            const rect = getCanvasRect();
             const mouseX = e.clientX - rect.left;
             const mouseY = e.clientY - rect.top;
             const centerX = rect.width / 2;
@@ -2950,10 +3105,109 @@ export function createFloatingPanel(node, jsonWidget) {
         return null;
     };
 
+    // 框选结算：矩形与框的视觉范围相交即选中；矩形太小当成在空白处点了一下
+    const applyMarqueeSelection = (rect, additive) => {
+        const x1 = Math.min(rect.x1, rect.x2);
+        const x2 = Math.max(rect.x1, rect.x2);
+        const y1 = Math.min(rect.y1, rect.y2);
+        const y2 = Math.max(rect.y1, rect.y2);
+
+        if (!additive) model.selection.clear();
+
+        if (x2 - x1 < 3 && y2 - y1 < 3) {
+            if (!additive) model.setActive(-1);
+        } else {
+            model.items.forEach((item, i) => {
+                if (!item || !Array.isArray(item.bbox)) return;
+                const b = getVisualBounds(item);
+                const p1 = logicToPhys(b.vXmin, b.vYmin);
+                const p2 = logicToPhys(b.vXmax, b.vYmax);
+                if (p2.x >= x1 && p1.x <= x2 && p2.y >= y1 && p1.y <= y2) {
+                    model.selection.add(i);
+                }
+            });
+            if (model.selection.size) {
+                model.setActive(Math.min(...model.selection));
+            } else if (!additive) {
+                model.setActive(-1);
+            }
+        }
+
+        updateListSelection();
+        syncEditorPanel();
+        drawCanvas();
+
+        if (model.selection.size) toast.show(`已框选 ${model.selection.size} 个框`);
+        else if (!additive) toast.show("框选区域为空", 1000);
+    };
+
+    // 开始拖动时确定这一组：多选且点在选区内 → 整组；否则只有自己
+    const beginMoveGroup = (targetIdx) => {
+        const indices = model.selection.size > 1 && model.selection.has(targetIdx)
+            ? Array.from(model.selection)
+            : [targetIdx];
+        dragStartGroup = indices
+            .filter((i) => Number.isInteger(i) && i >= 0 && i < model.items.length
+                && model.items[i] && Array.isArray(model.items[i].bbox)
+                && !model.items[i]._locked) // 锁住的框不跟着动
+            .sort((a, b) => a - b)
+            .map((i) => ({ index: i, bbox: [...model.items[i].bbox] }));
+    };
+
+    // 原地复制整组：深拷贝保留框色 / 锁定 / 极小框对齐等会话状态，
+    // 并把选区与 active 一起切到副本上，后续拖动只动副本
+    const duplicateItemsInPlace = (indices, focusIdx) => {
+        const valid = [...new Set(indices)]
+            .filter((i) => Number.isInteger(i) && i >= 0 && i < model.items.length
+                && model.items[i] && Array.isArray(model.items[i].bbox))
+            .sort((a, b) => a - b);
+        if (!valid.length) return null;
+
+        const added = [];
+        const indexMap = new Map();
+        valid.forEach((i) => {
+            const clone = JSON.parse(JSON.stringify(model.items[i]));
+            delete clone._isNew;
+            model.items.push(clone);
+            indexMap.set(i, model.items.length - 1);
+            added.push(model.items.length - 1);
+        });
+
+        model.selection.clear();
+        added.forEach((i) => model.selection.add(i));
+        const active = indexMap.get(focusIdx) ?? added[0];
+        model.setActive(active);
+        syncColorWidget();
+        // 复制必须独占一步撤销，不能和之前的连续输入合并
+        model.resetCoalesce();
+        return { added, active };
+    };
+
+    // 复制结果的落盘 / 重绘（Ctrl+D 没有后续 mouseup，需要自己收尾）
+    const commitDuplicates = (added) => {
+        if (!added.length) return false;
+        saveEditorChanges();
+        renderList(false);
+        updateListSelection();
+        syncEditorPanel();
+        drawCanvas();
+        if (node.graph) node.graph.setDirtyCanvas(true, true);
+        return true;
+    };
+
+    // 记录一次「Alt 拖拽复制」的候选，等 mousemove 真的产生位移再执行
+    const armCopyDrag = (targetIdx) => {
+        const indices = model.selection.size > 1 && model.selection.has(targetIdx)
+            ? Array.from(model.selection)
+            : [targetIdx];
+        pendingCopyDrag = { indices, targetIdx };
+    };
+
     canvas.addEventListener("mousedown", (e) => {
+        invalidateCanvasRect();
         canvas.focus();
         snapReady = false;
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
@@ -3013,6 +3267,11 @@ export function createFloatingPanel(node, jsonWidget) {
 
         const hit = getHitInfo(mouseX, mouseY);
         const isCtrl = e.ctrlKey || e.metaKey;
+        dragCtrlKey = isCtrl;
+        dragStartAlt = e.altKey;
+        dragCopyMode = false;
+        dragCreating = false;
+        pendingCopyDrag = null;
 
         if (hit.type === "select-label") {
             const targetIdx = hit.index;
@@ -3040,13 +3299,26 @@ export function createFloatingPanel(node, jsonWidget) {
                 dragMode = "move";
                 dragStartMouse = { x: mouseX, y: mouseY };
                 dragStartBBox = [...item.bbox];
+                beginMoveGroup(targetIdx);
+                if (e.altKey && !isCtrl) armCopyDrag(targetIdx);
             }
-            
+
             e.preventDefault();
             return;
         }
 
         if (hit.type === "create") {
+            // Shift + 拖空白 = 框选（普通拖拽仍然是新建框）
+            if (e.shiftKey) {
+                marqueeRect = { x1: mouseX, y1: mouseY, x2: mouseX, y2: mouseY };
+                marqueeAdditive = isCtrl;
+                dragMode = "marquee";
+                dragStartMouse = { x: mouseX, y: mouseY };
+                drawCanvas();
+                e.preventDefault();
+                return;
+            }
+
             if (!isCtrl) model.selection.clear();
 
             const { w, h } = getCanvasSize(); // 🌟 补上缺失的宽高获取
@@ -3069,6 +3341,7 @@ export function createFloatingPanel(node, jsonWidget) {
             model.selection.add(model.active);
 
             dragMode = "resize-br";
+            dragCreating = true;
             dragStartMouse = { x: mouseX, y: mouseY };
             dragStartBBox = [...model.items[model.active].bbox];
 
@@ -3090,6 +3363,12 @@ export function createFloatingPanel(node, jsonWidget) {
             dragMode = hit.type;
             dragStartMouse = { x: mouseX, y: mouseY };
             dragStartBBox = [...model.items[targetIdx].bbox];
+            if (hit.type === "move") {
+                beginMoveGroup(targetIdx);
+                if (e.altKey && !isCtrl && model.items[targetIdx] && !model.items[targetIdx]._locked) {
+                    armCopyDrag(targetIdx);
+                }
+            }
         }
 
         updateListSelection();
@@ -3101,14 +3380,14 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     window.addEventListener("mousemove", (e) => {
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
         if (isPanning) {
             model.view.x = panStartViewX + (mouseX - panStartX);
             model.view.y = panStartViewY + (mouseY - panStartY);
-            drawCanvas();
+            requestDraw();
             return;
         }
 
@@ -3235,8 +3514,43 @@ export function createFloatingPanel(node, jsonWidget) {
 
         if (!dragMode) return;
 
+        if (dragMode === "marquee") {
+            if (marqueeRect) {
+                marqueeRect.x2 = mouseX;
+                marqueeRect.y2 = mouseY;
+                requestDraw();
+            }
+            return;
+        }
+
+        // Alt 复制：真正拖出位移才生成副本，之后本次拖动只移动副本
+        if (pendingCopyDrag) {
+            const start = pendingCopyDrag;
+            if (Math.abs(mouseX - dragStartMouse.x) < 2 && Math.abs(mouseY - dragStartMouse.y) < 2) return;
+            pendingCopyDrag = null;
+            const copied = duplicateItemsInPlace(start.indices, start.targetIdx);
+            if (copied) {
+                dragCopyMode = true;
+                dragCopyCount = copied.added.length;
+                dragStartBBox = [...model.items[copied.active].bbox];
+                beginMoveGroup(copied.active);
+                updateListSelection();
+                syncEditorPanel();
+            }
+        }
+
+        // 副本拖动仍走正常吸附：Alt 已用于触发复制，不再兼任「临时关闭吸附」
+        const bypassSnap = dragStartAlt && !dragCopyMode;
+
         const dx = mouseX - dragStartMouse.x;
         const dy = mouseY - dragStartMouse.y;
+
+        // 新建框的起点是零尺寸的点：按鼠标所在象限决定在拉哪个角，
+        // 这样左上 / 右上 / 左下 / 右下四个方向都能画，拖动中越过起点也会自动换向
+        if (dragCreating) {
+            dragMode = "resize-" + (dy >= 0 ? "b" : "t") + (dx >= 0 ? "r" : "l");
+        }
+
         const scale = getActualScale();
         const logicDx = dx / scale;
         const logicDy = dy / scale;
@@ -3251,15 +3565,25 @@ export function createFloatingPanel(node, jsonWidget) {
             // 🌟 核心修复：用起始快照算出初始视觉边界，防止每一帧重复叠加总位移
             const tempItem = { bbox: dragStartBBox, _align: model.items[model.active]._align };
             const { isExtreme, vXmin, vYmin, vXmax, vYmax } = getVisualBounds(tempItem);
-            
+
+            // 这次拖动带走的框：多选时整组，否则只有自己
+            const group = dragStartGroup.length
+                ? dragStartGroup
+                : [{ index: model.active, bbox: dragStartBBox }];
+
+            let targetXmin;
+            let targetYmin;
+            let visualVx = null;
+            let visualVy = null;
+
             if (isExtreme) {
                 let newVx = vXmin + logicDx;
                 let newVy = vYmin + logicDy;
 
-                newVx = applySnap(newVx, e.altKey, true);
-                newVy = applySnap(newVy, e.altKey, false);
+                newVx = applySnap(newVx, bypassSnap, true);
+                newVy = applySnap(newVy, bypassSnap, false);
 
-                const snapped = snapMoveRect({ x: newVx, y: newVy, w: GRID_SNAP, h: GRID_SNAP }, e.altKey);
+                const snapped = snapMoveRect({ x: newVx, y: newVy, w: GRID_SNAP, h: GRID_SNAP }, bypassSnap);
                 newVx = snapped.x;
                 newVy = snapped.y;
                 setGuides(snapped.guides);
@@ -3267,17 +3591,21 @@ export function createFloatingPanel(node, jsonWidget) {
                 newVx = Math.max(-limitX, Math.min(newVx, limitX - GRID_SNAP));
                 newVy = Math.max(-limitY, Math.min(newVy, limitY - GRID_SNAP));
 
-                applyVisualBounds(model.items[model.active], newVx, newVy);
+                visualVx = newVx;
+                visualVy = newVy;
+                // 视觉代理与真实框是同一个平移，换算回真实坐标
+                targetXmin = newVx + (dragStartBBox[1] - vXmin);
+                targetYmin = newVy + (dragStartBBox[0] - vYmin);
             } else {
                 let newXmin = vXmin + logicDx;
                 let newYmin = vYmin + logicDy;
 
-                newXmin = applySnap(newXmin, e.altKey, true);
-                newYmin = applySnap(newYmin, e.altKey, false);
+                newXmin = applySnap(newXmin, bypassSnap, true);
+                newYmin = applySnap(newYmin, bypassSnap, false);
 
                 const snapped = snapMoveRect(
                     { x: newXmin, y: newYmin, w: vXmax - vXmin, h: vYmax - vYmin },
-                    e.altKey
+                    bypassSnap
                 );
                 newXmin = snapped.x;
                 newYmin = snapped.y;
@@ -3286,10 +3614,36 @@ export function createFloatingPanel(node, jsonWidget) {
                 newXmin = Math.max(-limitX, Math.min(newXmin, limitX - (vXmax - vXmin)));
                 newYmin = Math.max(-limitY, Math.min(newYmin, limitY - (vYmax - vYmin)));
 
-                model.items[model.active].bbox = [
-                    newYmin, newXmin,
-                    newYmin + (vYmax - vYmin), newXmin + (vXmax - vXmin)
-                ];
+                targetXmin = newXmin;
+                targetYmin = newYmin;
+            }
+
+            if (isExtreme && group.length === 1) {
+                // 单个极小框：仍走视觉代理反算，保持原来的取整行为
+                applyVisualBounds(model.items[model.active], visualVx, visualVy);
+            } else {
+                // 整组按同一位移移动，相对位置不变
+                let dx = targetXmin - dragStartBBox[1];
+                let dy = targetYmin - dragStartBBox[0];
+
+                if (group.length > 1) {
+                    // 整组不许出画布：按整组包围盒夹一次位移
+                    let gXmin = Infinity, gXmax = -Infinity, gYmin = Infinity, gYmax = -Infinity;
+                    group.forEach(({ bbox }) => {
+                        gYmin = Math.min(gYmin, bbox[0]);
+                        gYmax = Math.max(gYmax, bbox[2]);
+                        gXmin = Math.min(gXmin, bbox[1]);
+                        gXmax = Math.max(gXmax, bbox[3]);
+                    });
+                    dx = Math.max(-limitX - gXmin, Math.min(dx, limitX - gXmax));
+                    dy = Math.max(-limitY - gYmin, Math.min(dy, limitY - gYmax));
+                }
+
+                group.forEach(({ index, bbox }) => {
+                    const item = model.items[index];
+                    if (!item) return;
+                    item.bbox = [bbox[0] + dy, bbox[1] + dx, bbox[2] + dy, bbox[3] + dx];
+                });
             }
         } else if (dragMode.startsWith("resize")) {
             // 🌟 核心补全：处理四角拉伸拖拽
@@ -3304,29 +3658,29 @@ export function createFloatingPanel(node, jsonWidget) {
             if (isTop) newYmin += logicDy;
 
             // 吸附处理（只吸附正在拖拽的边，固定边不动）
-            if (isLeft) newXmin = applySnap(newXmin, e.altKey, true);
-            if (isRight) newXmax = applySnap(newXmax, e.altKey, true);
-            if (isTop) newYmin = applySnap(newYmin, e.altKey, false);
-            if (isBottom) newYmax = applySnap(newYmax, e.altKey, false);
+            if (isLeft) newXmin = applySnap(newXmin, bypassSnap, true);
+            if (isRight) newXmax = applySnap(newXmax, bypassSnap, true);
+            if (isTop) newYmin = applySnap(newYmin, bypassSnap, false);
+            if (isBottom) newYmax = applySnap(newYmax, bypassSnap, false);
 
             const edgeGuides = [];
             if (isLeft) {
-                const r = snapEdge(newXmin, "x", e.altKey);
+                const r = snapEdge(newXmin, "x", bypassSnap);
                 newXmin = r.value;
                 if (r.guide) edgeGuides.push(r.guide);
             }
             if (isRight) {
-                const r = snapEdge(newXmax, "x", e.altKey);
+                const r = snapEdge(newXmax, "x", bypassSnap);
                 newXmax = r.value;
                 if (r.guide) edgeGuides.push(r.guide);
             }
             if (isTop) {
-                const r = snapEdge(newYmin, "y", e.altKey);
+                const r = snapEdge(newYmin, "y", bypassSnap);
                 newYmin = r.value;
                 if (r.guide) edgeGuides.push(r.guide);
             }
             if (isBottom) {
-                const r = snapEdge(newYmax, "y", e.altKey);
+                const r = snapEdge(newYmax, "y", bypassSnap);
                 newYmax = r.value;
                 if (r.guide) edgeGuides.push(r.guide);
             }
@@ -3355,7 +3709,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 Math.max(newYmin, newYmax), Math.max(newXmin, newXmax),
             ];
         }
-        drawCanvas();
+        requestDraw();
     });
 
     window.addEventListener("mouseup", () => {
@@ -3369,7 +3723,24 @@ export function createFloatingPanel(node, jsonWidget) {
             canvas.style.cursor = "default";
             return;
         }
-        if (!dragMode) return;
+        if (!dragMode) {
+            dragCreating = false;
+            return;
+        }
+        // Alt+单击（没有真正拖动）不该留下重叠副本
+        pendingCopyDrag = null;
+        dragCreating = false;
+
+        if (dragMode === "marquee") {
+            const rect = marqueeRect;
+            dragMode = null;
+            marqueeRect = null;
+            if (rect) applyMarqueeSelection(rect, marqueeAdditive);
+            marqueeAdditive = false;
+            drawCanvas();
+            if (node.graph) node.graph.setDirtyCanvas(true, true);
+            return;
+        }
 
         const currentDragMode = dragMode;
         const currentActive = model.active;
@@ -3383,11 +3754,23 @@ export function createFloatingPanel(node, jsonWidget) {
                     let w = xmax - xmin;
                     let h = ymax - ymin;
 
+                    // 单击（没有位移）时把选区收敛到这一个框，
+                    // 否则点一个已在多选里的框时，Ctrl+C 复制的是整组旧选区
+                    const unchanged =
+                        Array.isArray(dragStartBBox) && item.bbox.join(",") === dragStartBBox.join(",");
+                    if (unchanged && !dragCtrlKey && !dragCopyMode && model.selection.size > 1) {
+                        model.selection.clear();
+                        model.selection.add(currentActive);
+                        updateListSelection();
+                        syncEditorPanel();
+                        drawCanvas();
+                    }
+
                     // 🌟 身份证查验
                     const isNew = !knownBboxHistory.has(dragStartBBox.join(","));
 
                     // 1. 防误触：新建框且极小，直接静默删除
-                    if (isNew && w <= 5 && h <= 5) {
+                    if (isNew && !dragCopyMode && w <= 5 && h <= 5) {
                         model.items.splice(currentActive, 1);
                         model.selection.delete(currentActive);
                         model.setActive(-1);
@@ -3418,8 +3801,12 @@ export function createFloatingPanel(node, jsonWidget) {
                         item.bbox = [finalYmin, finalXmin, finalYmin + finalSize, finalXmin + finalSize];
                     }
                     
-                    // 3. 刷新通行证
+                    // 3. 刷新通行证（整组一起记，避免下次被当成新建框）
                     knownBboxHistory.add(item.bbox.join(","));
+                    dragStartGroup.forEach(({ index }) => {
+                        const moved = model.items[index];
+                        if (moved && Array.isArray(moved.bbox)) knownBboxHistory.add(moved.bbox.join(","));
+                    });
                 }
             }
 
@@ -3437,6 +3824,12 @@ export function createFloatingPanel(node, jsonWidget) {
         } finally {
             setGuides([]);
             snapReady = false;
+            dragStartGroup = [];
+            pendingCopyDrag = null;
+            if (dragCopyCount) toast.show(`已复制 ${dragCopyCount} 个框`);
+            dragCopyCount = 0;
+            dragCopyMode = false;
+            updateListSelection();
             drawCanvas();
             if (node.graph) node.graph.setDirtyCanvas(true, true);
         }
@@ -3503,7 +3896,7 @@ export function createFloatingPanel(node, jsonWidget) {
     // --- 🌟 双击修改描述功能 ---
     canvas.addEventListener("dblclick", (e) => {
         e.preventDefault();
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
@@ -3623,19 +4016,60 @@ export function createFloatingPanel(node, jsonWidget) {
         return copy;
     };
 
+    // 复制时同时写系统剪贴板：带这个前缀的文本才算「我们复制的框」，
+    // 这样「最后复制的是什么」由剪贴板自己决定，不会再被残留的图片抢走粘贴
+    const CLIPBOARD_PREFIX = "moss-bbox:";
+
+    const fallbackCopyText = (text) => {
+        try {
+            const area = document.createElement("textarea");
+            area.value = text;
+            area.style.cssText = "position: fixed; left: -9999px; top: 0; opacity: 0;";
+            document.body.appendChild(area);
+            area.select();
+            document.execCommand("copy");
+            document.body.removeChild(area);
+        } catch (e) {
+            console.warn("[MOSS] 写入剪贴板失败:", e);
+        }
+    };
+
+    const writeClipboardText = (text) => {
+        try {
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(text).catch(() => fallbackCopyText(text));
+                return;
+            }
+        } catch (e) {
+            // 继续走兜底
+        }
+        fallbackCopyText(text);
+    };
+
+    const parseClipboardBoxes = (text) => {
+        if (typeof text !== "string" || !text.startsWith(CLIPBOARD_PREFIX)) return null;
+        try {
+            const data = JSON.parse(text.slice(CLIPBOARD_PREFIX.length));
+            if (!Array.isArray(data)) return null;
+            return data.filter((it) => it && Array.isArray(it.bbox) && it.bbox.length === 4);
+        } catch (e) {
+            return null;
+        }
+    };
+
     const copySelectedBoxes = () => {
-        const idxs = model.selection.size
-            ? Array.from(model.selection)
-            : model.active !== -1
-              ? [model.active]
-              : [];
+        const inRange = (i) => Number.isInteger(i) && i >= 0 && i < model.items.length;
+        const selected = Array.from(model.selection).filter(inRange);
+        const idxs = selected.length ? selected : inRange(model.active) ? [model.active] : [];
         if (!idxs.length) return false;
         idxs.sort((a, b) => a - b);
         bboxClipboard = idxs
             .map((i) => model.items[i])
             .filter(Boolean)
             .map(cloneItemForClipboard);
-        return bboxClipboard.length > 0;
+        if (!bboxClipboard.length) return false;
+        writeClipboardText(CLIPBOARD_PREFIX + JSON.stringify(bboxClipboard));
+        return true;
     };
 
     const pasteBoxes = () => {
@@ -3643,7 +4077,9 @@ export function createFloatingPanel(node, jsonWidget) {
         const { w, h } = getCanvasSize();
         const limitX = w / 2;
         const limitY = h / 2;
-        const offset = 10; // 粘出来的框稍微错开，避免完全重叠看不见
+        // 网格吸附时往右下挪一整格（16 / 32）并落到网格线上，否则只错开 10px
+        const onGrid = snapMode === "grid";
+        const offset = onGrid ? GRID_SNAP : 10;
 
         const added = [];
         bboxClipboard.forEach((src) => {
@@ -3653,6 +4089,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
             const bw = bbox[3] - bbox[1];
             const bh = bbox[2] - bbox[0];
+            // 整格平移，不再二次吸附：否则原本不在网格上的框可能被拉回左边
             const xmin = Math.max(-limitX, Math.min(bbox[1] + offset, limitX - bw));
             const ymin = Math.max(-limitY, Math.min(bbox[0] + offset, limitY - bh));
 
@@ -3680,8 +4117,20 @@ export function createFloatingPanel(node, jsonWidget) {
     };
 
     // 只在"面板内"或"画布聚焦"时接管快捷键，避免抢走 ComfyUI 自己的复制粘贴
+    // 焦点随时会飘走（浏览器默认行为、ComfyUI 的全局监听），
+    // 所以用「最后一次按下的位置」判断上下文，焦点只作为兜底
+    let pointerInsidePanel = false;
+    document.addEventListener(
+        "pointerdown",
+        (e) => {
+            pointerInsidePanel = panel.contains(e.target) || e.target === canvas;
+        },
+        true
+    );
+
     const isOurContext = (target) => {
         if (target === canvas || panel.contains(target)) return true;
+        if (pointerInsidePanel) return true;
         const ae = document.activeElement;
         return ae === canvas || (ae && panel.contains(ae));
     };
@@ -3708,11 +4157,117 @@ export function createFloatingPanel(node, jsonWidget) {
         if (!isOurContext(e.target)) return;
 
         if (copySelectedBoxes()) {
+            toast.show(`已复制 ${bboxClipboard.length} 个框`);
+            e.preventDefault();
+            e.stopPropagation();
+        } else {
+            toast.show("没有选中可复制的框", 1000);
+        }
+    };
+    window.addEventListener("keydown", onPanelCopyKeydown, true);
+
+    // Ctrl+A 全选 / Ctrl+D 原地复制 / Esc 取消选择
+    const onPanelEditKeydown = (e) => {
+        if (!document.body.contains(panel)) {
+            window.removeEventListener("keydown", onPanelEditKeydown, true);
+            return;
+        }
+        if (e.defaultPrevented || !isPanelOpen() || isTypingElsewhere()) return;
+        if (!isOurContext(e.target)) return;
+
+        const key = (e.key || "").toLowerCase();
+        const isCtrl = e.ctrlKey || e.metaKey;
+
+        if (key === "escape" && !isCtrl && !e.altKey) {
+            if (!model.selection.size && model.active === -1 && !marqueeRect) return;
+            // 框选拖到一半按 Esc：直接作废，不结算选区
+            if (marqueeRect) {
+                dragMode = null;
+                marqueeRect = null;
+                marqueeAdditive = false;
+                pendingCopyDrag = null;
+            }
+            model.selection.clear();
+            model.setActive(-1);
+            updateListSelection();
+            syncEditorPanel();
+            drawCanvas();
+            if (node.graph) node.graph.setDirtyCanvas(true, true);
+            toast.show("已取消选择", 1000);
+            // 不拦事件：颜色浮层、内联输入框等也要收到 Esc
+            return;
+        }
+
+        if (!isCtrl || e.altKey) return;
+
+        if (key === "a") {
+            if (!model.items.length) {
+                toast.show("当前没有边界框", 1000);
+                return;
+            }
+            model.selection.clear();
+            model.items.forEach((_, i) => model.selection.add(i));
+            model.setActive(model.items.length - 1);
+            updateListSelection();
+            syncEditorPanel();
+            drawCanvas();
+            toast.show(`已全选 ${model.items.length} 个框`);
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
+
+        if (key === "d") {
+            const idxs = model.selection.size
+                ? Array.from(model.selection)
+                : model.active >= 0 ? [model.active] : [];
+            if (!idxs.length) {
+                toast.show("没有选中可复制的框", 1000);
+                return;
+            }
+            const copied = duplicateItemsInPlace(idxs, model.active >= 0 ? model.active : idxs[0]);
+            if (!copied) return;
+            commitDuplicates(copied.added);
+            toast.show(`已复制 ${copied.added.length} 个框（原地）`);
             e.preventDefault();
             e.stopPropagation();
         }
     };
-    window.addEventListener("keydown", onPanelCopyKeydown, true);
+    window.addEventListener("keydown", onPanelEditKeydown, true);
+
+    // 按住修饰键时，画布顶部常驻这一组快捷键说明；松开 / 窗口失焦后收起
+    const HINT_ALT = "Alt · 拖动框 = 复制副本（原件留在原处）";
+    const HINT_CTRL = "Ctrl · C 复制 / V 粘贴 / A 全选 / D 原地复制";
+    const HINT_SHIFT = "Shift · 拖空白 = 框选 / 方向键 = 按步长微移";
+    const hintFor = (e) => {
+        if (e.altKey && !e.ctrlKey && !e.metaKey) return HINT_ALT;
+        if ((e.ctrlKey || e.metaKey) && !e.altKey) return HINT_CTRL;
+        if (e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) return HINT_SHIFT;
+        return "";
+    };
+    const detachModifierHints = () => {
+        window.removeEventListener("keydown", onModifierKeydown, true);
+        window.removeEventListener("keyup", onModifierKeyup, true);
+        window.removeEventListener("blur", onWindowBlur);
+    };
+    const onModifierKeydown = (e) => {
+        if (!document.body.contains(panel)) { detachModifierHints(); return; }
+        if (!isPanelOpen() || isTypingElsewhere()) { toast.setHint(""); return; }
+        toast.setHint(hintFor(e));
+    };
+    const onModifierKeyup = (e) => {
+        if (!document.body.contains(panel)) { detachModifierHints(); return; }
+        toast.setHint(hintFor(e));
+    };
+    const onWindowBlur = () => toast.setHint("");
+    window.addEventListener("keydown", onModifierKeydown, true);
+    window.addEventListener("keyup", onModifierKeyup, true);
+    window.addEventListener("blur", onWindowBlur);
+
+    node._mossToastCleanup = () => {
+        detachModifierHints();
+        toast.destroy();
+    };
 
     const onPanelPaste = (e) => {
         if (!document.body.contains(panel)) {
@@ -3722,14 +4277,40 @@ export function createFloatingPanel(node, jsonWidget) {
         if (e.defaultPrevented || !isPanelOpen() || isTypingElsewhere()) return;
         if (!isOurContext(e.target)) return;
 
-        // 剪贴板里是图片 → 交给背景图逻辑（canvas 的 paste 监听会处理）
+        // 1) 剪贴板里是我们复制过的框（带前缀）→ 只认剪贴板，不再退回内存
+        const clipText = e.clipboardData?.getData ? e.clipboardData.getData("text/plain") : "";
+        if (typeof clipText === "string" && clipText.startsWith(CLIPBOARD_PREFIX)) {
+            const clipBoxes = parseClipboardBoxes(clipText);
+            if (!clipBoxes || !clipBoxes.length) return; // 内容坏了就当没有，别粘出旧框
+            bboxClipboard = clipBoxes;
+            if (pasteBoxes()) {
+                toast.show(`已粘贴 ${bboxClipboard.length} 个框`);
+                e.preventDefault();
+                e.stopPropagation();
+            }
+            return;
+        }
+
+        // 2) 剪贴板里是图片 → 图片优先，当背景图处理
         const items = e.clipboardData?.items;
-        const hasImage = items
-            ? Array.from(items).some((it) => it.type && it.type.startsWith("image/"))
-            : false;
-        if (hasImage) return;
+        const imageItem = items
+            ? Array.from(items).find((it) => it.type && it.type.startsWith("image/"))
+            : null;
+        if (imageItem) {
+            // 焦点不在画布上时 canvas 自己的 paste 监听不会触发，这里补上
+            if (document.activeElement !== canvas) {
+                const file = imageItem.getAsFile();
+                if (file && loadBackgroundFromBlob(file)) {
+                    toast.show("已粘贴背景图");
+                    e.preventDefault();
+                    e.stopPropagation();
+                }
+            }
+            return;
+        }
 
         if (bboxClipboard.length && pasteBoxes()) {
+            toast.show(`已粘贴 ${bboxClipboard.length} 个框`);
             e.preventDefault();
             e.stopPropagation();
         }
@@ -3743,6 +4324,7 @@ export function createFloatingPanel(node, jsonWidget) {
             // 🌟 优先：处于"操控背景图"模式时，Delete/Backspace 删除背景图
             if (bgActive && bgImage) {
                 deleteBackgroundImage();
+                toast.show("已删除背景图");
                 e.preventDefault();
                 return;
             }
@@ -3767,6 +4349,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 syncEditorPanel();
                 drawCanvas();
                 if (node.graph) node.graph.setDirtyCanvas(true, true);
+                toast.show(`已删除 ${indicesToRemove.length} 个框`);
                 e.preventDefault();
             }
         }
@@ -3774,7 +4357,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     canvas.addEventListener("mousemove", (e) => {
         if (isPanning || dragMode) return;
-        const rect = canvasContainer.getBoundingClientRect();
+        const rect = getCanvasRect();
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
@@ -3804,11 +4387,17 @@ export function createFloatingPanel(node, jsonWidget) {
         }
 
         if (hoveredLabel) {
-            canvas.style.cursor = "pointer";
+            canvas.style.cursor = e.altKey ? "copy" : "pointer";
             return;
         }
 
         const hit = getHitInfo(mouseX, mouseY);
+
+        // Alt 悬停在框上 = 拖拽复制；Shift 悬停在空白处 = 框选
+        if (e.altKey && !e.shiftKey && hit.type === "move") {
+            canvas.style.cursor = "copy";
+            return;
+        }
 
         if (hit.type === "create") {
             // 画布外的黑色区域拖动是“平移”，光标也换成抓手
@@ -4381,7 +4970,7 @@ export function createFloatingPanel(node, jsonWidget) {
             
             <div style="margin-bottom: 10px;"><b style="color:#fff;">🖱️ 基础操作：</b></div>
             <ul style="margin: 0 0 10px 20px; padding: 0; color: #ccc;">
-                <li>在空白处按住左键拖动：<b>创建新框</b></li>
+                <li>在空白处按住左键拖动：<b>创建新框</b>（四个方向都能拖出，越过起点自动换向）</li>
                 <li>拖动框的内部或数字标签：<b>移动框</b></li>
                 <li>拖动框的四个角：<b>拉伸缩放</b></li>
                 <li>双击框内部：<b>快速编辑描述</b></li>
@@ -4390,11 +4979,16 @@ export function createFloatingPanel(node, jsonWidget) {
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">⌨️ 快捷键：</b></div>
             <ul style="margin: 0 0 10px 20px; padding: 0; color: #ccc;">
+                <li><b>Shift + 拖空白</b>：框选多个框；<b>Ctrl + Shift + 拖空白</b>：追加框选</li>
+                <li><b>Alt + 拖动框</b>：复制选中的框并拖动副本，原件留在原处</li>
+                <li><b>Ctrl + A</b>：全选；<b>Esc</b>：取消选择</li>
+                <li><b>Ctrl + D</b>：原地复制选中框（副本与原件重合，复制后可直接拖动）</li>
+                <li><b>Ctrl + C / Ctrl + V</b>：复制框到系统剪贴板 / 粘贴框或背景图</li>
                 <li><b>Delete / Backspace</b>：删除选中框（或在操控模式下删除背景图）</li>
                 <li><b>方向键</b>：微移选中的框 1px；<b>Shift + 方向键</b>：按吸附步长移动</li>
                 <li><b>撤销 / 重做 / 重置视图</b>：画布右下角的 ↶ ↷ 🎯 按钮</li>
-                <li><b>Ctrl + V</b>：在画布聚焦时粘贴背景图</li>
-                <li><b>Ctrl + 点击</b>：多选框</li>
+                <li><b>Ctrl + 点击</b>：增减多选框</li>
+                <li><b>按住 Alt / Ctrl / Shift</b>：画布顶部显示这一组快捷键提示；每次操作后也会短暂显示结果</li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">📐 极小框控制：</b></div>

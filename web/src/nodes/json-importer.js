@@ -455,6 +455,8 @@ export const jsonImporterExtension = {
                     window.removeEventListener("keydown", node._mossKeyHandler, true);
                     node._mossKeyHandler = null;
                 }
+                node._mossToastCleanup?.();
+                node._mossToastCleanup = null;
                 node._mossPanelUpdate = null;
                 node._mossPendingBackground = null;
 

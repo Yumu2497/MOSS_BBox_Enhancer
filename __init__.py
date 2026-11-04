@@ -7,7 +7,7 @@ from .MOSS_BBox_Resizer import NODE_CLASS_MAPPINGS as RESIZER_MAPPINGS, NODE_DIS
 # 导入绘制边界框节点（按框色画到图上）
 from .MOSS_DrawBBoxes import NODE_CLASS_MAPPINGS as DRAW_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS as DRAW_NAMES
 
-__version__ = "1.1.10"
+__version__ = "1.1.23"
 
 # 告诉 ComfyUI 去加载 web 目录下的前端 JS (如果你还有快捷键按钮的话)
 WEB_DIRECTORY = "./web"
