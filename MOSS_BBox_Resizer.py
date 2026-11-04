@@ -83,11 +83,11 @@ class MOSS_BBox_Resizer:
             }
         }
 
-    RETURN_TYPES = ("ARRAY", "STRING", "INT", "INT")
-    RETURN_NAMES = ("边界框数组", "映射后JSON", "目标宽度", "目标高度")
+    RETURN_TYPES = ("ARRAY", "STRING", "INT", "INT", "ARRAY")
+    RETURN_NAMES = ("元素数组", "映射后JSON", "目标宽度", "目标高度", "边界框")
     OUTPUT_NODE = True
     FUNCTION = "resize_bbox"
-    CATEGORY = "MOSS/边界框工具"
+    CATEGORY = "MOSS_BBox_Enhancer"
 
     @staticmethod
     def _to_official_elements(items, width, height):
@@ -120,17 +120,49 @@ class MOSS_BBox_Resizer:
             elements.append(element)
         return elements
 
+    @staticmethod
+    def _to_pixel_boxes(items, width, height):
+        """映射后的像素框：给官方「创建边界框」或「MOSS 绘制边界框」用。"""
+        half_w, half_h = width / 2, height / 2
+        boxes = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            bbox = item.get("bbox")
+            if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                continue
+            ymin, xmin, ymax, xmax = bbox
+            x1, y1 = xmin + half_w, ymin + half_h
+            x2, y2 = xmax + half_w, ymax + half_h
+            is_text = item.get("label") == "text"
+
+            box = {
+                "x": round(x1),
+                "y": round(y1),
+                "width": round(x2 - x1),
+                "height": round(y2 - y1),
+                "metadata": {
+                    "type": "text" if is_text else "obj",
+                    "text": item.get("text", "") if is_text else "",
+                    "desc": item.get("caption", item.get("desc", "")),
+                },
+            }
+            if isinstance(item.get("color"), str) and item["color"]:
+                box["color"] = item["color"]
+            boxes.append(box)
+        return boxes
+
     def resize_bbox(self, layout_json, auto_guess_old_size, guess_ratio, old_width, old_height, new_width, new_height, resize_mode, scale_factor):
         if not layout_json.strip():
             return {"ui": {"old_width": [old_width], "old_height": [old_height]},
-                    "result": ([], layout_json, new_width, new_height)}
+                    "result": ([], layout_json, new_width, new_height, [])}
 
         try:
             data = json.loads(layout_json)
         except Exception as e:
             print(f"[MOSS Resizer] JSON 解析失败: {e}")
             return {"ui": {"old_width": [old_width], "old_height": [old_height]},
-                    "result": ([], layout_json, new_width, new_height)}
+                    "result": ([], layout_json, new_width, new_height, [], [])}
 
         # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
         data, draft_w, draft_h = normalize_layout(data, old_width, old_height)
@@ -141,7 +173,7 @@ class MOSS_BBox_Resizer:
         items = data if isinstance(data, list) else data.get("items", [])
         if not items:
             return {"ui": {"old_width": [old_width], "old_height": [old_height]},
-                    "result": ([], layout_json, new_width, new_height)}
+                    "result": ([], layout_json, new_width, new_height, [], [])}
 
         # 🌟 核心功能：自动推测原尺寸
         actual_old_w, actual_old_h = old_width, old_height
@@ -240,9 +272,10 @@ class MOSS_BBox_Resizer:
             final_data["width"] = new_width
             final_data["height"] = new_height
         resized_json = json.dumps(final_data, ensure_ascii=False, separators=(',', ':'))
+        pixel_boxes = self._to_pixel_boxes(items, new_width, new_height)
         return {"ui": {"old_width": [actual_old_w], "old_height": [actual_old_h]},
                 "result": (self._to_official_elements(items, new_width, new_height), resized_json,
-                           new_width, new_height)}
+                           new_width, new_height, pixel_boxes)}
 
 NODE_CLASS_MAPPINGS = {"MOSS_BBox_Resizer": MOSS_BBox_Resizer}
 NODE_DISPLAY_NAME_MAPPINGS = {"MOSS_BBox_Resizer": "MOSS BBox 尺寸映射器"}

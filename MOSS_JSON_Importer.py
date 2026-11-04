@@ -1,11 +1,17 @@
 import json
 import nodes
 import io
+import os
 import base64
-from PIL import Image
+import time
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 from aiohttp import web
 from server import PromptServer
 import folder_paths
+
+
+# 预览图最长边，超过就等比缩小，避免大画布每次执行都生成几 MB 的 PNG
+PREVIEW_MAX_SIZE = 768
 
 
 def sanitize_items(items):
@@ -232,6 +238,77 @@ async def extract_moss_prompt(request):
     except Exception as e:
         return web.json_response({"success": False, "error": f"解析失败: {str(e)}"})
 
+def _preview_rgb(item, index, colors):
+    """预览用的描边色：框色 → 调色板首色 → 兜底红。"""
+    color = colors.get(index)
+    if not color and isinstance(item, dict):
+        palette = item.get("palette")
+        if isinstance(palette, list) and palette and isinstance(palette[0], str):
+            color = palette[0]
+    if not color:
+        return (255, 74, 74)
+    try:
+        return ImageColor.getrgb(color)
+    except Exception:
+        return (255, 74, 74)
+
+
+def _tensor_to_pil(image):
+    """把 ComfyUI 的 IMAGE 张量（取第一帧）转成 PIL。"""
+    frame = image
+    shape = getattr(frame, "shape", None)
+    if shape is not None and len(shape) == 4:
+        frame = frame[0]
+    array = frame.detach().cpu().numpy() if hasattr(frame, "detach") else frame
+    array = (array * 255.0).clip(0, 255).astype("uint8")
+    return Image.fromarray(array)
+
+
+def render_layout_preview(items, colors, width, height, background=None):
+    """按画布尺寸画一张布局预览：每个框的描边取各自颜色，左上角标序号。"""
+    width = max(1, int(width))
+    height = max(1, int(height))
+    scale = min(1.0, PREVIEW_MAX_SIZE / max(width, height))
+    w = max(1, int(round(width * scale)))
+    h = max(1, int(round(height * scale)))
+
+    if background is not None:
+        resample = getattr(Image, "Resampling", Image).LANCZOS
+        img = background.convert("RGB").resize((w, h), resample)
+    else:
+        img = Image.new("RGB", (w, h), (30, 30, 32))
+
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, w - 1, h - 1], outline=(70, 70, 74), width=1)
+
+    line = max(1, round(min(w, h) / 300))
+    font = ImageFont.load_default()
+    half_w, half_h = width / 2.0, height / 2.0
+
+    for index, item in enumerate(items or []):
+        bbox = item.get("bbox") if isinstance(item, dict) else None
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        ymin, xmin, ymax, xmax = bbox
+        x1 = (xmin + half_w) * scale
+        y1 = (ymin + half_h) * scale
+        x2 = (xmax + half_w) * scale
+        y2 = (ymax + half_h) * scale
+        color = _preview_rgb(item, index, colors)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=line)
+
+        tag = str(index + 1)
+        try:
+            tag_w = draw.textlength(tag, font=font)
+        except Exception:
+            tag_w = 7 * len(tag)
+        if x2 - x1 > tag_w + 6 and y2 - y1 > 14:
+            draw.rectangle([x1, y1, x1 + tag_w + 5, y1 + 13], fill=color)
+            draw.text((x1 + 3, y1 + 1), tag, fill=(20, 20, 20), font=font)
+
+    return img
+
+
 class MOSS_JSON_Importer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -244,6 +321,10 @@ class MOSS_JSON_Importer:
                                            "tooltip": "画布高度。若连接了 image 且 use_image_size 开启，执行时会被图片高度覆盖，并同步回该控件。"}),
                 "use_image_size": ("BOOLEAN", {"default": True,
                                                 "tooltip": "连接 image 时自动使用图片宽高作为画布尺寸，并把该图片设为面板背景图。"}),
+                "bbox_colors": ("STRING", {"default": "", "multiline": False,
+                                           "tooltip": "面板自动写入：{序号: 颜色}，只用于「边界框」输出，不进入 layout_json。"}),
+                "preview": ("BOOLEAN", {"default": True,
+                                        "tooltip": "运行后在节点下方预览画布（框 + 序号）。关掉则不生成图片。"}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "可选图片：用作画布尺寸参考和面板背景图。"}),
@@ -251,13 +332,13 @@ class MOSS_JSON_Importer:
         }
     
     OUTPUT_NODE = True
-    RETURN_TYPES = ("ARRAY", "ARRAY", "STRING", "STRING")
-    RETURN_NAMES = ("元素数组", "边界框数组", "主提示词", "完整提示词")
+    RETURN_TYPES = ("ARRAY", "STRING", "STRING", "ARRAY")
+    RETURN_NAMES = ("元素数组", "主提示词", "完整提示词", "边界框")
     FUNCTION = "execute"
     CATEGORY = "MOSS_BBox_Enhancer"
 
     def execute(self, layout_json, canvas_width, canvas_height,
-                use_image_size=True, image=None):
+                use_image_size=True, image=None, bbox_colors="", preview=True):
         ui = {}
         print(f"[MOSS Import] 进入: image={'None' if image is None else f'tensor{tuple(image.shape)}'}, "
           f"use_image_size={use_image_size}, widget尺寸={canvas_width}x{canvas_height}")
@@ -289,7 +370,7 @@ class MOSS_JSON_Importer:
 
         # 提前返回时，也要保证返回 4 个值
         if not layout_json.strip():
-            return {"ui": ui, "result": ([], [], "", "")}
+            return {"ui": ui, "result": ([], "", "", [])}
 
         try:
             data = json.loads(layout_json)
@@ -298,7 +379,7 @@ class MOSS_JSON_Importer:
             print(f"[MOSS Import] JSON 解析失败，按纯文本处理: {e}")
             prompt = layout_json.strip()
             # 因为没有画框，元素数组和边界框都为空，主提示词和完整提示词都是这段纯文本
-            return {"ui": ui, "result": ([], [], prompt, prompt)}
+            return {"ui": ui, "result": ([], prompt, prompt, [])}
 
         # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
         data, draft_w, draft_h = normalize_layout(data, canvas_width, canvas_height)
@@ -322,11 +403,23 @@ class MOSS_JSON_Importer:
         # 2. 获取 items 列表
         items = data.get("items", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
+        # 面板传来的框色：{序号: "#rrggbb"}，不写入 layout_json
+        colors = {}
+        try:
+            if bbox_colors and bbox_colors.strip():
+                raw_colors = json.loads(bbox_colors)
+                if isinstance(raw_colors, dict):
+                    for k, v in raw_colors.items():
+                        if isinstance(v, str) and v.strip():
+                            colors[int(k)] = v.strip()
+        except Exception as e:
+            print(f"[MOSS Import] 框色解析失败: {e}")
+
         elements = []
-        bboxes = []
+        colored_boxes = []
         half_w, half_h = canvas_width / 2, canvas_height / 2
 
-        for item in items:
+        for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
             bbox = item.get("bbox")
@@ -357,28 +450,31 @@ class MOSS_JSON_Importer:
                 element["text"] = item.get("text", "")
             palette = item.get("palette")
             if isinstance(palette, list) and palette:
-                element["color_palette"] = palette
+                element["color_palette"] = list(palette)
             tags = item.get("tags")
             if isinstance(tags, list) and tags:
                 element["tags"] = tags
             elements.append(element)
 
-            # 生成像素 BBox
-            bbox_obj = {
+            # 边界框：像素坐标，给官方「创建边界框」或「MOSS 绘制边界框」用。
+            # 只带 type / text / desc + 框色，不写 palette，避免和框色混为一谈。
+            frame_color = colors.get(index)
+            meta = {
+                "type": "text" if is_text else "obj",
+                "text": item.get("text", "") if is_text else "",
+                "desc": item.get("caption", ""),
+            }
+
+            plain_box = {
                 "x": round(x1),
                 "y": round(y1),
                 "width": round(x2 - x1),
                 "height": round(y2 - y1),
-                "metadata": {
-                    "type": "text" if is_text else "obj",
-                    "text": item.get("text", "") if is_text else "",
-                    "desc": item.get("caption", ""),
-                    "palette": item.get("palette", []) or []
-                }
+                "metadata": meta,
             }
-            if isinstance(item.get("tags"), list) and item["tags"]:
-                bbox_obj["metadata"]["tags"] = item["tags"]
-            bboxes.append(bbox_obj)
+            if frame_color:
+                plain_box["color"] = frame_color
+            colored_boxes.append(plain_box)
 
         # ================= 核心修复：完整提示词 =================
         # 如果画了框（元素数组不为空），就把整个 JSON 作为字符串输出；否则只输出主提示词。
@@ -392,11 +488,22 @@ class MOSS_JSON_Importer:
         else:
             full_prompt = prompt
 
+        if preview:
+            try:
+                background = _tensor_to_pil(image) if image is not None else None
+                preview_img = render_layout_preview(items, colors, canvas_width, canvas_height, background)
+                temp_dir = folder_paths.get_temp_directory()
+                filename = f"moss_layout_{int(time.time() * 1000)}.png"
+                preview_img.save(os.path.join(temp_dir, filename), compress_level=1)
+                ui["images"] = [{"filename": filename, "subfolder": "", "type": "temp"}]
+            except Exception as e:
+                print(f"[MOSS Import] 预览生成失败: {e}")
+
         print(f"[MOSS Import] 成功导入 {len(elements)} 个框，主提示词: {len(prompt)} 字符，完整提示词模式: {'JSON' if elements else '纯文本'}")
         
-        # 返回：元素数组、边界框数组、主提示词、完整提示词
-        return {"ui": ui, "result": (elements, bboxes, prompt, full_prompt)}
+        # 返回：元素数组、主提示词、完整提示词、边界框（带颜色）
+        return {"ui": ui, "result": (elements, prompt, full_prompt, colored_boxes)}
 
 
 NODE_CLASS_MAPPINGS = {"MOSS_JSON_Importer": MOSS_JSON_Importer}
-NODE_DISPLAY_NAME_MAPPINGS = {"MOSS_JSON_Importer": "MOSS JSON 导入边界框"}
+NODE_DISPLAY_NAME_MAPPINGS = {"MOSS_JSON_Importer": "MOSS 布局编辑器"}
