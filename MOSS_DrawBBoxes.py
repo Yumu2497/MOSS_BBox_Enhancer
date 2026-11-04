@@ -103,6 +103,25 @@ def _readable(rgb):
     return (0, 0, 0) if (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) > 140 else (255, 255, 255)
 
 
+def _one_line(text):
+    """把任意文本压成单行：换行、制表符、连续空格统一成一个空格。"""
+    return " ".join(str(text or "").split())
+
+
+def _fit_text(draw, text, font, max_width):
+    """按宽度截断并补省略号；量不了长度时退回原文本，不让绘图崩掉。"""
+    if not text:
+        return ""
+    try:
+        if draw.textlength(text, font=font) <= max_width:
+            return text
+        while text and draw.textlength(text + "…", font=font) > max_width:
+            text = text[:-1]
+        return text + "…" if text else ""
+    except Exception:
+        return text[: max(1, int(max_width // 8))]
+
+
 def draw_boxes(pil, boxes, line_width, show_index, show_label, fallback):
     overlay = Image.new("RGBA", pil.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -123,15 +142,13 @@ def draw_boxes(pil, boxes, line_width, show_index, show_label, fallback):
             draw.text((x1 + 4, y1 + 2), tag, fill=_readable(color) + (255,), font=font)
 
         meta = _meta(box)
-        label = str(meta.get("text") or meta.get("desc") or "")
+        # 多行文本（文本框常见）PIL 量不了长度，先压成单行
+        label = _one_line(meta.get("text") or meta.get("desc") or "")
         label_y = y1 + fs + 8
         if show_label and label and label_y + fs <= y2:
             max_w = x2 - x1 - 12
             if max_w > 8:
-                if draw.textlength(label, font=font) > max_w:
-                    while label and draw.textlength(label + "…", font=font) > max_w:
-                        label = label[:-1]
-                    label = label + "…" if label else ""
+                label = _fit_text(draw, label, font, max_w)
                 if label:
                     draw.text((x1 + 6, label_y), label, fill=color + (255,), font=font)
 

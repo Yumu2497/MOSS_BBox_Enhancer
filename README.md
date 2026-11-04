@@ -1,6 +1,6 @@
 # MOSS BBox Enhancer
 
-> v1.1.9
+> v1.1.10
 
 用于 ComfyUI 的 MOSS 布局 JSON 导入、边界框编辑、尺寸映射和按框色绘制边界框的插件。
 
@@ -76,7 +76,7 @@
 - `image`：底图，可选。不接时按框的最大范围生成一张深灰底图。
 - `line_width`：线宽，默认 3。
 - `show_index`：在框左上角画序号。
-- `show_label`：在框内画描述 / 文字内容（放不下时自动跳过）。
+- `show_label`：在框内画描述 / 文字内容（放不下时自动跳过；多行文本压成一行显示，超宽按宽度截断）。
 - `fallback_color`：没有携带颜色的框使用这个颜色，默认 `#ff4a4a`，节点上是取色器，点一下就能选。
 
 颜色只取边框自带的 `color`，没有就用 `fallback_color`；`metadata.palette` 属于构图信息，不参与描边。
