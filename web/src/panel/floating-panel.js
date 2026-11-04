@@ -356,14 +356,53 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // 把各框的颜色写给隐藏控件，后端只在「边界框」输出里使用
     const syncColorWidget = () => {
-        const widget = node.widgets?.find((w) => w.name === "bbox_colors");
-        if (!widget) return;
         const map = {};
         model.items.forEach((it, i) => {
             if (it && typeof it._color === "string" && it._color) map[i] = it._color;
         });
-        const next = Object.keys(map).length ? JSON.stringify(map) : "";
-        if (widget.value !== next) widget.value = next;
+
+        const widget = node.widgets?.find((w) => w.name === "bbox_colors");
+        if (widget) {
+            const next = Object.keys(map).length ? JSON.stringify(map) : "";
+            if (widget.value !== next) widget.value = next;
+        }
+        // 节点 properties 跟着工作流一起存，控件被清空时还能从这儿恢复
+        if (node.properties) node.properties.mossBboxColors = map;
+    };
+
+    // 打开面板 / 刷新页面时把颜色读回来：先看隐藏控件，再退回节点 properties
+    const readStoredColors = () => {
+        const map = {};
+        const widget = node.widgets?.find((w) => w.name === "bbox_colors");
+        if (widget && typeof widget.value === "string" && widget.value.trim()) {
+            try {
+                const parsed = JSON.parse(widget.value);
+                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                    Object.entries(parsed).forEach(([key, value]) => {
+                        if (typeof value === "string" && value) map[key] = value;
+                    });
+                }
+            } catch (e) {
+                console.warn("[MOSS] 框色缓存解析失败:", e);
+            }
+        }
+        const cached = node.properties?.mossBboxColors;
+        if (cached && typeof cached === "object") {
+            Object.entries(cached).forEach(([key, value]) => {
+                if (!map[key] && typeof value === "string" && value) map[key] = value;
+            });
+        }
+        return map;
+    };
+
+    const restoreItemColors = () => {
+        const map = readStoredColors();
+        if (!Object.keys(map).length) return;
+        model.items.forEach((item, index) => {
+            if (!item || item._color) return;
+            const color = map[index];
+            if (typeof color === "string" && color) item._color = color;
+        });
     };
 
     frameColorInput.oninput = () => setFrameColor(frameColorInput.value);
@@ -4085,7 +4124,9 @@ export function createFloatingPanel(node, jsonWidget) {
         try {
             const data = JSON.parse(jsonWidget.value || "{}");
             model.setItems(Array.isArray(data) ? data : data.items || []);
+            // 先按 bbox 继承本次会话的颜色（最准），再用缓存补上其余
             carryEditorState(prevItems, model.items);
+            restoreItemColors();
             syncColorWidget();
 
             knownBboxHistory.clear();
