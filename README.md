@@ -1,6 +1,6 @@
 # MOSS BBox Enhancer
 
-> v1.4.3
+> v1.4.4
 
 用于 ComfyUI 的 MOSS 布局 JSON 导入、边界框编辑、尺寸映射和按框色绘制边界框的插件。
 

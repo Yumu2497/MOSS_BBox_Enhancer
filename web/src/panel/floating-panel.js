@@ -4420,12 +4420,15 @@ export function createFloatingPanel(node, jsonWidget) {
     const isTypingElsewhere = () => {
         const ae = document.activeElement;
         if (!ae) return false;
-        return (
-            ae.tagName === "INPUT" ||
-            ae.tagName === "TEXTAREA" ||
-            ae.tagName === "SELECT" ||
-            ae.isContentEditable
-        );
+        if (ae.isContentEditable) return true;
+        const tag = ae.tagName;
+        if (tag === "TEXTAREA" || tag === "SELECT") return true;
+        if (tag === "INPUT") {
+            const type = String(ae.type || "text").toLowerCase();
+            // 勾选框 / 单选 / 滑块 / 颜色块不是文本输入，不该拦 Delete
+            return !["checkbox", "radio", "button", "submit", "reset", "range", "color"].includes(type);
+        }
+        return false;
     };
 
     const onPanelCopyKeydown = (e) => {
@@ -4448,6 +4451,39 @@ export function createFloatingPanel(node, jsonWidget) {
     };
     window.addEventListener("keydown", onPanelCopyKeydown, true);
 
+    // 删除选中的框；处于「操控背景图」模式时优先删背景图。返回是否处理过。
+    // 画布聚焦、右侧列表点选、右上角全选都走这一个入口，不再只认 canvas 的 keydown
+    const deleteSelectionOrBackground = () => {
+        if (bgActive && bgImage) {
+            deleteBackgroundImage();
+            toast.show("已删除背景图");
+            return true;
+        }
+        if (!model.selection.size) return false;
+
+        const indicesToRemove = Array.from(model.selection).sort((a, b) => b - a);
+        const raw = JSON.parse(jsonWidget.value);
+        const isArray = Array.isArray(raw);
+        const data = isArray ? raw : { ...raw, items: model.items };
+        const items = isArray ? data : data.items;
+        indicesToRemove.forEach((idx) => items.splice(idx, 1));
+
+        model.setActive(-1);
+        model.selection.clear();
+
+        isUpdatingFromUI = true;
+        jsonWidget.value = serializeLayout(data);
+        if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
+        isUpdatingFromUI = false;
+        recordHistory(jsonWidget.value, false);
+        renderList();
+        syncEditorPanel();
+        drawCanvas();
+        if (node.graph) node.graph.setDirtyCanvas(true, true);
+        toast.show(`已删除 ${indicesToRemove.length} 个框`);
+        return true;
+    };
+
     // Ctrl+A 全选 / Ctrl+D 原地复制 / Esc 取消选择
     const onPanelEditKeydown = (e) => {
         if (!document.body.contains(panel)) {
@@ -4459,6 +4495,15 @@ export function createFloatingPanel(node, jsonWidget) {
 
         const key = (e.key || "").toLowerCase();
         const isCtrl = e.ctrlKey || e.metaKey;
+
+        // Delete / Backspace：焦点在画布、列表行、全选按钮上都生效；
+        // 输入框 / 下拉框里由 isTypingElsewhere 挡住，不会误删
+        if ((key === "delete" || key === "backspace") && !isCtrl && !e.altKey) {
+            if (!deleteSelectionOrBackground()) return;
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
 
         if (key === "escape" && !isCtrl && !e.altKey) {
             if (!model.selection.size && model.active === -1 && !marqueeRect) return;
@@ -4598,44 +4643,6 @@ export function createFloatingPanel(node, jsonWidget) {
         }
     };
     document.addEventListener("paste", onPanelPaste, true);
-
-    canvas.addEventListener("keydown", (e) => {
-        if (e.key === "Delete" || e.key === "Backspace") {
-            if (document.activeElement !== canvas) return;
-
-            // 🌟 优先：处于"操控背景图"模式时，Delete/Backspace 删除背景图
-            if (bgActive && bgImage) {
-                deleteBackgroundImage();
-                toast.show("已删除背景图");
-                e.preventDefault();
-                return;
-            }
-            
-            if (model.selection.size > 0 && document.activeElement === canvas) {
-                const indicesToRemove = Array.from(model.selection).sort((a, b) => b - a);
-                const raw = JSON.parse(jsonWidget.value);
-                const isArray = Array.isArray(raw);
-                const data = isArray ? raw : { ...raw, items: model.items };
-                const items = isArray ? data : data.items;
-                indicesToRemove.forEach((idx) => items.splice(idx, 1));
-
-                model.setActive(-1);
-                model.selection.clear();
-
-                isUpdatingFromUI = true;
-                jsonWidget.value = serializeLayout(data);
-                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
-                isUpdatingFromUI = false;
-                recordHistory(jsonWidget.value, false);
-                renderList();
-                syncEditorPanel();
-                drawCanvas();
-                if (node.graph) node.graph.setDirtyCanvas(true, true);
-                toast.show(`已删除 ${indicesToRemove.length} 个框`);
-                e.preventDefault();
-            }
-        }
-    });
 
     canvas.addEventListener("mousemove", (e) => {
         if (isPanning || dragMode) return;
