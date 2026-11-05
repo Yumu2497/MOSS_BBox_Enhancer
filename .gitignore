@@ -3,6 +3,10 @@ __pycache__/
 *.pyo
 *.pyc
 
+# 用户自定义提示词预设（个人数据，不进仓库）
+user_presets.json
+.user_presets.*.tmp
+
 # 编辑器临时文件
 .vscode/
 .idea/

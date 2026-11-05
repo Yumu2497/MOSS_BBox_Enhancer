@@ -1,13 +1,27 @@
 import { app } from "../../../../scripts/app.js";
 import { api } from "../../../../scripts/api.js";
-import { serializeLayout } from "../core/json-schema.js";
+import { buildLayoutImport } from "../core/import-layout.js";
 import { openPanelIds } from "../core/panel-registry.js";
 import { attachJsonCopyButtons } from "../ui/copy-buttons.js";
 import { createFloatingPanel } from "../panel/floating-panel.js";
+import { showImportModeDialog, pickImageFile } from "../ui/import-dialog.js";
+import { setPluginVersion } from "../core/version.js";
+
+// 版本号只在后端 MOSS_Version.py 维护，这里启动时拉一次给面板标题栏用
+let versionRequested = false;
+function ensurePluginVersion() {
+    if (versionRequested) return;
+    versionRequested = true;
+    api.fetchApi("/moss/version")
+        .then((resp) => resp.json())
+        .then((data) => setPluginVersion(data?.version || ""))
+        .catch((err) => console.warn("[MOSS] 读取版本号失败:", err));
+}
 
 export const jsonImporterExtension = {
     name: "Comfy.MOSS_BBox_Manager",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
+        ensurePluginVersion();
         if (nodeData.name !== "MOSS_JSON_Importer") return;
 
         // 🌟 onExecuted：接收 Python 返回的 width/height/background_images
@@ -300,144 +314,97 @@ export const jsonImporterExtension = {
                 }, 120);
             }
             // 🌟 新增：导入图片提示词按钮
+            // 先选导入范围，再打开文件框；三种范围的结果由 core/import-layout.js 计算
+            const setLayoutValue = (value) => {
+                jsonWidget.value = value;
+                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
+            };
+            const setCanvasSize = (w, h) => {
+                const wWidget = node.widgets.find((x) => x.name === "canvas_width");
+                const hWidget = node.widgets.find((x) => x.name === "canvas_height");
+                if (wWidget) { wWidget.value = w; wWidget.callback?.(wWidget.value); }
+                if (hWidget) { hWidget.value = h; hWidget.callback?.(hWidget.value); }
+            };
+            const applyFlow = (flow, mode) => {
+                const result = buildLayoutImport({ flow, mode, currentValue: jsonWidget.value });
+                if (result.error) {
+                    alert(result.error);
+                    return;
+                }
+                setLayoutValue(result.value);
+                if (Number.isFinite(result.width) && Number.isFinite(result.height)) {
+                    setCanvasSize(result.width, result.height);
+                }
+                alert(result.message);
+            };
+
             node.addWidget("button", "📂 导入图片中的提示词JSON", null, () => {
-                console.log("[MOSS] 导入按钮被点击");
-                
-                const fileInput = document.createElement("input");
-                fileInput.type = "file";
-                fileInput.accept = "image/png, image/jpeg, image/webp";
-                // 🌟 修复 1：必须添加到 DOM 中，防止某些浏览器拦截 click
-                fileInput.style.display = "none";
-                document.body.appendChild(fileInput);
-                
-                fileInput.onchange = async (e) => {
-                    const file = e.target.files[0];
-                    // 清理 DOM
-                    document.body.removeChild(fileInput);
+                showImportModeDialog(node.id).then(async (mode) => {
+                    if (!mode) return;
+                    console.log("[MOSS] 导入范围:", mode);
+
+                    const file = await pickImageFile();
                     if (!file) return;
-                    
                     console.log("[MOSS] 选择了文件:", file.name);
-                    
+
                     const formData = new FormData();
                     formData.append("image", file);
-                    
+
                     try {
                         console.log("[MOSS] 发送请求到 /moss/extract_prompt...");
                         const resp = await api.fetchApi("/moss/extract_prompt", {
                             method: "POST",
                             body: formData
                         });
-                        
+
                         // 检查 HTTP 状态
                         if (!resp.ok) {
                             throw new Error(`HTTP error! status: ${resp.status}`);
                         }
-                        
+
                         const data = await resp.json();
                         console.log("[MOSS] 后端返回数据:", data);
-                        
-                        if (data.success) {
-                            const flows = data.flows;
-                            let targetFlow = flows[0];
-                            
-                            // 🌟 多流程选择
-                            if (flows.length > 1) {
-                                let optionsText = flows.map((f, i) => {
-                                    let desc = "";
-                                    if (f.moss_jsons.length > 0) desc = `包含自制节点 (尺寸: ${f.moss_jsons[0].w}x${f.moss_jsons[0].h})`;
-                                    else if (f.official_boxes.length > 0) desc = `包含官方画框 (尺寸: ${f.official_boxes[0].w}x${f.official_boxes[0].h}, ${f.official_boxes[0].boxes.length}个框)`;
-                                    else desc = `纯文本提示词 (${f.texts.length} 段)`;
-                                    return `${i + 1}. 采样器 ID:${f.samplerId} - ${desc}`;
-                                }).join('\n');
-                                
-                                const choice = prompt(`检测到 ${flows.length} 个独立的生成流程，请选择要导入的序号：\n\n${optionsText}`, "1");
-                                if (choice === null) return;
-                                
-                                const idx = parseInt(choice) - 1;
-                                if (idx >= 0 && idx < flows.length) {
-                                    targetFlow = flows[idx];
-                                } else {
-                                    alert("输入无效，取消导入。");
-                                    return;
-                                }
-                            }
 
-                            // 🌟 提取或组装数据
-                            if (targetFlow.moss_jsons.length > 0) {
-                                const moss = targetFlow.moss_jsons[0];
-                                jsonWidget.value = moss.json;
-                                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
-                                
-                                const wWidget = node.widgets.find((w) => w.name === "canvas_width");
-                                const hWidget = node.widgets.find((w) => w.name === "canvas_height");
-                                if (wWidget) { wWidget.value = moss.w; wWidget.callback?.(wWidget.value); }
-                                if (hWidget) { hWidget.value = moss.h; hWidget.callback?.(hWidget.value); }
-
-                                alert(`✅ 成功导入 MOSS JSON！\n尺寸: ${moss.w} x ${moss.h}`);
-                            } 
-                            else if (targetFlow.official_boxes.length > 0) {
-                                const boxData = targetFlow.official_boxes[0];
-                                const W = boxData.w, H = boxData.h;
-                                const halfW = W / 2, halfH = H / 2;
-                                
-                                const items = boxData.boxes.map(box => {
-                                    const item = {
-                                        label: box.metadata?.type === "text" ? "text" : "object",
-                                        caption: box.metadata?.desc || "",
-                                        bbox: [
-                                            box.y - halfH, 
-                                            box.x - halfW, 
-                                            box.y - halfH + box.height, 
-                                            box.x - halfW + box.width
-                                        ]
-                                    };
-                                    if (box.metadata?.text) item.text = box.metadata.text;
-                                    if (box.metadata?.palette && box.metadata.palette.length > 0) item.palette = box.metadata.palette;
-                                    return item;
-                                });
-                                
-                                const finalJson = {
-                                    summary: { caption: targetFlow.texts.length > 0 ? targetFlow.texts[0] : "" },
-                                    items: items,
-                                    bbox_coord_space: "abs_centralized",
-                                    bbox_format: "yxyx"
-                                };
-
-                                jsonWidget.value = serializeLayout(finalJson);
-                                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
-
-                                const wWidget = node.widgets.find((w) => w.name === "canvas_width");
-                                const hWidget = node.widgets.find((w) => w.name === "canvas_height");
-                                if (wWidget) { wWidget.value = W; wWidget.callback?.(wWidget.value); }
-                                if (hWidget) { hWidget.value = H; hWidget.callback?.(hWidget.value); }
-
-                                alert(`✅ 已将官方边界框转换为 MOSS JSON 并导入！\n尺寸: ${W} x ${H}`);
-                            } 
-                            else if (targetFlow.texts.length > 0) {
-                                const allTexts = targetFlow.texts.join('\n\n');
-                                jsonWidget.value = JSON.stringify({
-                                    summary: { caption: allTexts },
-                                    items: [],
-                                    bbox_coord_space: "abs_centralized",
-                                    bbox_format: "yxyx"
-                                }, null, 2);
-                                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
-                                
-                                alert(`✅ 未找到边界框数据，但已为您提取并填入纯文本提示词。`);
-                            }
-                            
-                        } else {
+                        if (!data.success) {
                             alert("❌ " + data.error);
+                            return;
                         }
+
+                        const flows = Array.isArray(data.flows) ? data.flows : [];
+                        if (!flows.length) {
+                            alert("❌ 没有在这张图片里找到可导入的生成流程。");
+                            return;
+                        }
+
+                        let targetFlow = flows[0];
+
+                        // 🌟 多流程选择
+                        if (flows.length > 1) {
+                            const optionsText = flows.map((f, i) => {
+                                let desc = "";
+                                if (f.moss_jsons.length > 0) desc = `包含自制节点 (尺寸: ${f.moss_jsons[0].w}x${f.moss_jsons[0].h})`;
+                                else if (f.official_boxes.length > 0) desc = `包含官方画框 (尺寸: ${f.official_boxes[0].w}x${f.official_boxes[0].h}, ${f.official_boxes[0].boxes.length}个框)`;
+                                else desc = `纯文本提示词 (${f.texts.length} 段)`;
+                                return `${i + 1}. 采样器 ID:${f.samplerId} - ${desc}`;
+                            }).join("\n");
+
+                            const choice = prompt(`检测到 ${flows.length} 个独立的生成流程，请选择要导入的序号：\n\n${optionsText}`, "1");
+                            if (choice === null) return;
+
+                            const idx = parseInt(choice, 10) - 1;
+                            if (!(idx >= 0 && idx < flows.length)) {
+                                alert("输入无效，取消导入。");
+                                return;
+                            }
+                            targetFlow = flows[idx];
+                        }
+
+                        applyFlow(targetFlow, mode);
                     } catch (err) {
                         console.error("[MOSS] 请求解析图片失败:", err);
                         alert("请求后端失败，请查看 F12 控制台！\n" + err.message);
                     }
-                };
-                
-                // 🌟 修复 2：触发点击
-                console.log("[MOSS] 触发 fileInput.click()");
-                fileInput.click();
+                });
             });
 
             const onRemoved = this.onRemoved;
@@ -457,8 +424,15 @@ export const jsonImporterExtension = {
                 }
                 node._mossToastCleanup?.();
                 node._mossToastCleanup = null;
+                node._mossPresetCleanup?.();
+                node._mossPresetCleanup = null;
+                node._mossVersionCleanup?.();
+                node._mossVersionCleanup = null;
                 node._mossPanelUpdate = null;
                 node._mossPendingBackground = null;
+                // 导入方式弹层如果还开着，跟着节点一起收掉
+                document.querySelectorAll(`.moss-import-mask[data-moss-node-id="${node.id}"]`)
+                    .forEach((el) => el.remove());
 
                 // 节点被移除：如果它是被整图重建掉的（Ctrl+Z），稍后会以同 id 重新出现，
                 // 那就保留"面板打开"的记录让新节点自动恢复；否则清掉。

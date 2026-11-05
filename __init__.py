@@ -7,7 +7,11 @@ from .MOSS_BBox_Resizer import NODE_CLASS_MAPPINGS as RESIZER_MAPPINGS, NODE_DIS
 # 导入绘制边界框节点（按框色画到图上）
 from .MOSS_DrawBBoxes import NODE_CLASS_MAPPINGS as DRAW_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS as DRAW_NAMES
 
-__version__ = "1.1.23"
+# 注册用户自定义提示词预设的读写接口（装饰器在导入时生效）
+from . import MOSS_Presets as _MOSS_Presets
+
+# 版本号只有一个来源，前端标题栏通过 GET /moss/version 读取
+from .MOSS_Version import __version__
 
 # 告诉 ComfyUI 去加载 web 目录下的前端 JS (如果你还有快捷键按钮的话)
 WEB_DIRECTORY = "./web"

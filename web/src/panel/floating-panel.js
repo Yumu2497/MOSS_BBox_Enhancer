@@ -3,6 +3,8 @@ import { openPanelIds } from "../core/panel-registry.js";
 import { createEditorModel } from "./editor-model.js";
 import { createRibbon, openPopover, closePopover } from "./ribbon.js";
 import { createToast } from "./toast.js";
+import { createPresetPanel } from "./preset-panel.js";
+import { getPluginVersion, onPluginVersion } from "../core/version.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -153,6 +155,24 @@ export function createFloatingPanel(node, jsonWidget) {
     const title = document.createElement("span");
     title.textContent = "边界框管理与预览";
     titleLeft.appendChild(title);
+
+    // 版本号从后端读，拿到之前先不占位，免得闪一下空胶囊
+    const versionTag = document.createElement("span");
+    versionTag.className = "moss-panel-version";
+    versionTag.style.cssText =
+        "font-size: 11px; font-weight: normal; color: #8a8a8a; padding: 1px 6px; border: 1px solid #4a4a4a; border-radius: 9px; line-height: 1.4; cursor: default;";
+    versionTag.style.display = "none";
+    titleLeft.appendChild(versionTag);
+    const applyVersion = (version) => {
+        if (!version) return;
+        versionTag.textContent = `v${version}`;
+        versionTag.title = `MOSS_BBox_Enhancer v${version}`;
+        versionTag.style.display = "inline-block";
+    };
+    applyVersion(getPluginVersion());
+    // 节点删掉时把订阅摘掉，别让回调拽着已经移除的节点
+    node._mossVersionCleanup?.();
+    node._mossVersionCleanup = onPluginVersion(applyVersion);
 
     // 🌟 修改：加上“帮助”文字
     const helpBtn = document.createElement("button");
@@ -421,6 +441,16 @@ export function createFloatingPanel(node, jsonWidget) {
     frameColorRow.appendChild(frameColorLabel);
     frameColorRow.appendChild(frameColorInput);
     frameColorRow.appendChild(frameColorAuto);
+
+    // 提示词预设：框色右边、输入栏上方，点开后是一层分组弹层
+    const presetBtn = document.createElement("button");
+    presetBtn.type = "button";
+    presetBtn.textContent = "提示词预设";
+    presetBtn.title = "给当前框套用提示词预设（标签可多选；Alt+点击切换类型前缀；按住 Shift 写入即覆盖描述）";
+    presetBtn.style.cssText =
+        "margin-left: auto; flex: 0 0 auto; padding: 2px 8px; border-radius: 4px; border: 1px solid #4a7ab5; " +
+        "background: #24405e; color: #dbe9ff; font-size: 11px; cursor: pointer; white-space: nowrap;";
+    frameColorRow.appendChild(presetBtn);
     editorContainer.appendChild(frameColorRow);
 
     // 框色读写（_color 由 sanitizeItemForJson 自动过滤，不会写进 JSON）
@@ -2616,6 +2646,35 @@ export function createFloatingPanel(node, jsonWidget) {
         model.items[model.active].text = textArea.value;
         saveEditorChanges();
     });
+
+    // 提示词预设：标签文本原样追加到当前框的描述；按住 Shift 写入则覆盖
+    const applyPresets = (texts, { overwrite }) => {
+        const item = model.active >= 0 ? model.items[model.active] : null;
+        if (!item) {
+            toast.show("请先选中一个框", 1200);
+            return;
+        }
+        const joined = texts.join(", ");
+        const current = typeof item.caption === "string" && item.caption
+            ? item.caption
+            : (typeof item.desc === "string" ? item.desc : "");
+        item.caption = overwrite ? joined : (current ? `${current}, ${joined}` : joined);
+        descArea.value = item.caption;
+        saveEditorChanges();
+        closePopover();
+        toast.show(overwrite ? `已覆盖描述：${joined}` : `已写入 ${texts.length} 个预设`, 1600);
+    };
+
+    const presetPanel = createPresetPanel({
+        onToast: (msg) => toast.show(msg, 1600),
+        onApply: applyPresets,
+    });
+    presetPanel.load();
+    presetBtn.addEventListener("click", async () => {
+        await presetPanel.load();
+        openPopover(presetBtn, presetPanel.el, { width: 340 });
+    });
+    node._mossPresetCleanup = () => presetPanel.destroy();
 
     // 🌟 获取视觉上的代理范围（边长 = 当前网格尺寸：16 或 32）
     const getVisualBounds = (item) => {
@@ -4989,6 +5048,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 <li><b>撤销 / 重做 / 重置视图</b>：画布右下角的 ↶ ↷ 🎯 按钮</li>
                 <li><b>Ctrl + 点击</b>：增减多选框</li>
                 <li><b>按住 Alt / Ctrl / Shift</b>：画布顶部显示这一组快捷键提示；每次操作后也会短暂显示结果</li>
+                <li><b>框色右侧「提示词预设」</b>：点标签选中（可多选），点「写入」追加到描述；按住 Shift 点「写入」覆盖描述。「方向」的起点 + 终点会拼成一段（从左到右），中间不加逗号；红色标题的类型自动带上「类型名：」前缀，选中后按住 Alt 点标签可切换带不带；自建类型的标题双击改名，单击后点右侧 × 或直接右键标题可删除</li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">📐 极小框控制：</b></div>
