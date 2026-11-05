@@ -5,6 +5,7 @@ import { createRibbon, openPopover, closePopover } from "./ribbon.js";
 import { createToast } from "./toast.js";
 import { createPresetPanel } from "./preset-panel.js";
 import { getPluginVersion, onPluginVersion } from "../core/version.js";
+import { snapAxisWithAnchors, snapEdgeToTargets, matchTarget } from "../core/bg-snap.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -23,6 +24,13 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // 拖动背景图时是否吸附画布边缘/中心（面板里的“吸附”勾选框控制）
     let bgSnap = true;
+    // 背景图吸附命中的辅助线（和框的吸附同一套视觉：蓝色虚线）
+    let bgSnapGuides = [];
+    const addBgGuide = (axis, pos) => {
+        if (pos === null || pos === undefined) return;
+        if (bgSnapGuides.some((g) => g.axis === axis && Math.abs(g.pos - pos) < 0.01)) return;
+        bgSnapGuides.push({ axis, pos });
+    };
     // 锁定长宽比：输入尺寸、拖拽边角都按比例同步
     let bgLockRatio = true;
 
@@ -42,6 +50,7 @@ export function createFloatingPanel(node, jsonWidget) {
         bgX = 0; bgY = 0; bgW = 0; bgH = 0;
         bgActive = false;
         bgDragMode = null;
+        bgSnapGuides = [];
         if (bgActiveCb) {
             bgActiveCb.checked = false;
             bgActiveCb.disabled = true;
@@ -3066,6 +3075,28 @@ export function createFloatingPanel(node, jsonWidget) {
             ctx.restore();
         }
 
+        // 背景图吸附：画法照搬框的辅助线，蓝色 1px 虚线，贯穿画布
+        if (bgSnapGuides.length) {
+            ctx.save();
+            ctx.strokeStyle = "#4a9eff";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([5, 4]);
+            bgSnapGuides.forEach((guide) => {
+                ctx.beginPath();
+                if (guide.axis === "x") {
+                    const px = logicToPhys(guide.pos, 0).x;
+                    ctx.moveTo(px, p1.y);
+                    ctx.lineTo(px, p2.y);
+                } else {
+                    const py = logicToPhys(0, guide.pos).y;
+                    ctx.moveTo(p1.x, py);
+                    ctx.lineTo(p2.x, py);
+                }
+                ctx.stroke();
+            });
+            ctx.restore();
+        }
+
         if (marqueeRect) {
             const x = Math.min(marqueeRect.x1, marqueeRect.x2);
             const y = Math.min(marqueeRect.y1, marqueeRect.y2);
@@ -3456,6 +3487,7 @@ export function createFloatingPanel(node, jsonWidget) {
             const dy = (mouseY - bgStartMouse.y) / getActualScale();
 
             let nx = bgStartBBox.x, ny = bgStartBBox.y, nw = bgStartBBox.w, nh = bgStartBBox.h;
+            bgSnapGuides = [];
 
             if (bgDragMode === "move") {
                 nx += dx;
@@ -3469,25 +3501,13 @@ export function createFloatingPanel(node, jsonWidget) {
                     const yTargets = [-canvasH / 2, 0, canvasH / 2];
 
                     // 用三个锚点（起始边 / 中心 / 结束边）里最近的那个去吸附
-                    const snapAxis = (pos, size, targets) => {
-                        const anchors = [pos - size / 2, pos, pos + size / 2];
-                        let bestDelta = null;
-                        for (const a of anchors) {
-                            for (const t of targets) {
-                                const d = t - a;
-                                if (
-                                    Math.abs(d) <= snapThreshold &&
-                                    (bestDelta === null || Math.abs(d) < Math.abs(bestDelta))
-                                ) {
-                                    bestDelta = d;
-                                }
-                            }
-                        }
-                        return bestDelta === null ? pos : pos + bestDelta;
-                    };
-
-                    nx = snapAxis(nx, nw, xTargets);
-                    ny = snapAxis(ny, nh, yTargets);
+                    const snappedX = snapAxisWithAnchors(nx, nw, xTargets, snapThreshold);
+                    const snappedY = snapAxisWithAnchors(ny, nh, yTargets, snapThreshold);
+                    nx = snappedX.pos;
+                    ny = snappedY.pos;
+                    // 命中的是画布的哪条线，就在那条线上画虚线（和框的吸附一致）
+                    addBgGuide("x", snappedX.target);
+                    addBgGuide("y", snappedY.target);
                 }
             } else {
                 const startL = bgStartBBox.x - bgStartBBox.w / 2;
@@ -3508,19 +3528,10 @@ export function createFloatingPanel(node, jsonWidget) {
                     const xTargets = [-canvasW / 2, 0, canvasW / 2];
                     const yTargets = [-canvasH / 2, 0, canvasH / 2];
 
-                    const snapEdge = (value, targets) => {
-                        let best = null;
-                        for (const t of targets) {
-                            const d = Math.abs(t - value);
-                            if (d <= snapThr && (best === null || d < Math.abs(best - value))) best = t;
-                        }
-                        return best === null ? value : best;
-                    };
-
-                    if (bgDragMode.includes("l")) L = snapEdge(L, xTargets);
-                    if (bgDragMode.includes("r")) R = snapEdge(R, xTargets);
-                    if (bgDragMode.includes("t")) T = snapEdge(T, yTargets);
-                    if (bgDragMode.includes("b")) B = snapEdge(B, yTargets);
+                    if (bgDragMode.includes("l")) L = snapEdgeToTargets(L, xTargets, snapThr).value;
+                    if (bgDragMode.includes("r")) R = snapEdgeToTargets(R, xTargets, snapThr).value;
+                    if (bgDragMode.includes("t")) T = snapEdgeToTargets(T, yTargets, snapThr).value;
+                    if (bgDragMode.includes("b")) B = snapEdgeToTargets(B, yTargets, snapThr).value;
                 }
 
                 let w = R - L;
@@ -3562,6 +3573,18 @@ export function createFloatingPanel(node, jsonWidget) {
                 ny = (T + B) / 2;
                 nw = Math.abs(R - L);
                 nh = Math.abs(B - T);
+
+                // 长宽比联动可能把刚吸附好的边又推开一点，所以按最终位置判断是否还落在目标线上
+                if (bgSnap) {
+                    const { w: cw, h: ch } = getCanvasSize();
+                    const xT = [-cw / 2, 0, cw / 2];
+                    const yT = [-ch / 2, 0, ch / 2];
+                    const markEdge = (value, targets, axis) => addBgGuide(axis, matchTarget(value, targets));
+                    if (bgDragMode.includes("l")) markEdge(nx - nw / 2, xT, "x");
+                    if (bgDragMode.includes("r")) markEdge(nx + nw / 2, xT, "x");
+                    if (bgDragMode.includes("t")) markEdge(ny - nh / 2, yT, "y");
+                    if (bgDragMode.includes("b")) markEdge(ny + nh / 2, yT, "y");
+                }
             }
 
             if (nw > 10 && nh > 10) {
@@ -3774,6 +3797,8 @@ export function createFloatingPanel(node, jsonWidget) {
     window.addEventListener("mouseup", () => {
         if (bgDragMode) {
             bgDragMode = null;
+            bgSnapGuides = [];
+            drawCanvas();
             if (syncBgSizeHook) syncBgSizeHook(); // 拖动/拉伸结束后刷新尺寸输入框
             return;
         }
@@ -5034,6 +5059,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 <li>拖动框的四个角：<b>拉伸缩放</b></li>
                 <li>双击框内部：<b>快速编辑描述</b></li>
                 <li>滚轮：<b>缩放画布</b>；中键拖动：<b>平移画布</b></li>
+                <li>开启「背景图设置 → 操控」后：拖动 / 拉伸背景图，靠近画布边缘或中心会<b>吸附并显示蓝色虚线</b></li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">⌨️ 快捷键：</b></div>
