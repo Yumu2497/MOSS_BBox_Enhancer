@@ -139,12 +139,78 @@ export function createFloatingPanel(node, jsonWidget) {
         if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
     }
 
+    // ================= 面板出现 / 收起的轻微缩放 =================
+    // 用独立的 scale 属性做动画，不动 transform（居中、拖拽都靠它定位）
+    let panelCloseAnim = null;
+    const cancelPanelCloseAnim = () => {
+        if (!panelCloseAnim) return;
+        try {
+            panelCloseAnim.cancel();
+        } catch (_) {
+            /* 忽略 */
+        }
+        panelCloseAnim = null;
+    };
+    const playPanelPop = () => {
+        cancelPanelCloseAnim();
+        if (!panel || typeof panel.animate !== "function") return;
+        try {
+            panel.animate(
+                [
+                    { scale: "0.972", opacity: 0.45 },
+                    { scale: "1", opacity: 1 },
+                ],
+                { duration: 170, easing: "cubic-bezier(0.2, 0.8, 0.3, 1)" }
+            );
+        } catch (_) {
+            /* 老浏览器忽略 */
+        }
+    };
+    const hidePanelAnimated = () => {
+        if (!panel || panel.style.display === "none") return;
+        // 关闭动画没跑完又点开时，取消它能恢复到正常透明度
+        cancelPanelCloseAnim();
+        if (typeof panel.animate !== "function") {
+            panel.style.display = "none";
+            return;
+        }
+        try {
+            const anim = panel.animate(
+                [
+                    { scale: "1", opacity: 1 },
+                    { scale: "0.972", opacity: 0 },
+                ],
+                { duration: 130, easing: "ease-in", fill: "forwards" }
+            );
+            panelCloseAnim = anim;
+            anim.onfinish = () => {
+                if (panelCloseAnim !== anim) return;
+                panelCloseAnim = null;
+                panel.style.display = "none";
+                // 关掉 fill: forwards，否则下次打开会被这条动画的 opacity 0 压住
+                try {
+                    anim.cancel();
+                } catch (_) {
+                    /* 忽略 */
+                }
+            };
+            anim.oncancel = () => {
+                if (panelCloseAnim === anim) panelCloseAnim = null;
+            };
+        } catch (_) {
+            panel.style.display = "none";
+        }
+    };
+
     const panelId = `moss-bbox-panel-${node.id}`;
     let panel = document.getElementById(panelId);
     if (panel) {
         panel.style.display = "flex";
         panel.style.zIndex = "10000";
+        playPanelPop();
         if (node._mossRefreshPanel) node._mossRefreshPanel();
+        // 窗口比上次小的话，重新打开时先把尺寸收进可视范围
+        node._mossPanelFit?.();
         return;
     }
 
@@ -152,7 +218,7 @@ export function createFloatingPanel(node, jsonWidget) {
     panel = document.createElement("div");
     panel.id = panelId;
     panel.style.cssText =
-        "position: fixed; left: 50%; top: 10%; transform: translateX(-50%); width: 750px; height: 600px; min-width: 450px; min-height: 400px; resize: both; overflow: hidden; background: rgba(30, 30, 30, 0.95); backdrop-filter: blur(10px); border: 1px solid #555; border-radius: 8px; display: flex; flex-direction: column; z-index: 9999; box-shadow: 0 10px 30px rgba(0,0,0,0.8); font-family: sans-serif; color: #eee; font-size: 13px;";
+        "position: fixed; left: 50%; top: 10%; transform: translateX(-50%); width: 750px; height: 600px; overflow: hidden; background: rgba(30, 30, 30, 0.95); backdrop-filter: blur(10px); border: 1px solid #555; border-radius: 8px; display: flex; flex-direction: column; z-index: 9999; box-shadow: 0 10px 30px rgba(0,0,0,0.8); font-family: sans-serif; color: #eee; font-size: 13px;";
 
     const header = document.createElement("div");
     header.style.cssText =
@@ -204,10 +270,10 @@ export function createFloatingPanel(node, jsonWidget) {
         "background: transparent; border: none; color: #aaa; cursor: pointer; font-size: 16px; font-weight: bold;";
     closeBtn.onclick = () => {
         setDetached(false); // 悬浮态要先收回，否则它会留在页面上
-        panel.style.display = "none";
         closeColorPopup();
         closePopover();
         openPanelIds.delete(node.id); // 用户主动关闭，不再自动恢复
+        hidePanelAnimated();
     };
     
     header.appendChild(titleLeft);
@@ -1991,6 +2057,26 @@ export function createFloatingPanel(node, jsonWidget) {
     contentContainer.appendChild(rightContainer);
     panel.appendChild(contentContainer);
     document.body.appendChild(panel);
+    playPanelPop();
+
+    // 🌟 主提示词输入框的高度上限：最多占右边栏的 3/4，
+    // 再高就会把下面的框列表挤没、甚至顶出面板底部
+    let promptMaxH = 0;
+    const fitPromptHeight = () => {
+        const h = rightContainer.clientHeight;
+        if (!h) return;
+        const cap = Math.max(80, Math.round(h * 0.75));
+        if (cap === promptMaxH) return;
+        promptMaxH = cap;
+        promptTextarea.style.maxHeight = `${cap}px`;
+    };
+    fitPromptHeight();
+    try {
+        // 面板缩放 / 窗口变化时右栏高度会变，上限跟着重算
+        new ResizeObserver(fitPromptHeight).observe(rightContainer);
+    } catch (_) {
+        /* 老浏览器忽略 */
+    }
 
     // ================= 面板位置 / 尺寸持久化 =================
     const PANEL_RECT_KEY = "moss.bbox.panelRect";
@@ -2016,8 +2102,9 @@ export function createFloatingPanel(node, jsonWidget) {
             saved = null;
         }
         if (!saved || !Number.isFinite(saved.left) || !Number.isFinite(saved.top)) return;
-        const w = Math.min(Math.max(saved.width || 750, 450), Math.max(450, window.innerWidth - 16));
-        const h = Math.min(Math.max(saved.height || 600, 300), Math.max(300, window.innerHeight - 16));
+        // 下限放宽到 240×200：吸附成半屏后可能比默认最小尺寸还小，得原样恢复
+        const w = Math.min(Math.max(saved.width || 750, 240), Math.max(240, window.innerWidth - 16));
+        const h = Math.min(Math.max(saved.height || 600, 200), Math.max(200, window.innerHeight - 16));
         const left = Math.min(Math.max(saved.left, 0), Math.max(0, window.innerWidth - w));
         const top = Math.min(Math.max(saved.top, 0), Math.max(0, window.innerHeight - 40));
         panel.style.transform = "none";
@@ -2028,6 +2115,348 @@ export function createFloatingPanel(node, jsonWidget) {
     };
     restorePanelRect();
 
+    // 🌟 宽度边界：面板不能横向越出视口，否则右侧手柄跑到屏幕外就抓不回来了。
+    // 高度不再设 max-height：有了八向缩放和贴边吸附，拖标题栏往下时自动压矮反而碍事，
+    // 面板允许临时沉到视口下方，抓住标题栏拖回来即可。
+    const PANEL_MARGIN = 8;
+    // 拖手柄时的最小尺寸；吸附成半屏时不受这个限制，可能比它还窄
+    const MIN_PANEL_W = 450;
+    const MIN_PANEL_H = 400;
+    let appliedMaxW = 0;
+    const applyPanelMaxSize = () => {
+        if (panel.style.display === "none") return;
+        // 清掉旧版本可能留下的高度上限
+        if (panel.style.maxHeight) panel.style.maxHeight = "";
+        const rect = panel.getBoundingClientRect();
+        // 居中态由 CSS 定位，左右各留边距；拖动过则从当前左边缘算可用宽度
+        const centered = panel.style.transform !== "none";
+        // 吸附有过渡时 rect 是动画中间值，用 inline 的目标值算上限，免得目标宽度被中途压掉
+        const inlineLeft = parseFloat(panel.style.left);
+        const baseLeft = centered ? rect.left : (Number.isFinite(inlineLeft) ? inlineLeft : rect.left);
+        const availW = centered
+            ? window.innerWidth - PANEL_MARGIN * 2
+            : window.innerWidth - baseLeft - PANEL_MARGIN;
+        const maxW = Math.max(200, Math.floor(availW));
+        if (maxW !== appliedMaxW) {
+            appliedMaxW = maxW;
+            panel.style.maxWidth = `${maxW}px`;
+        }
+    };
+    node._mossPanelFit = applyPanelMaxSize;
+    applyPanelMaxSize();
+
+    // ================= 八向缩放 =================
+    // CSS 的 resize 只给右下角一个手柄，这里自己做 8 个透明手柄：
+    // 上下左右四边 + 四角，拖哪边改哪边，对边保持不动。
+    const HANDLE_THICK = 6;
+    const HANDLE_CORNER = 12;
+    let panelResize = null;
+
+    const startPanelResize = (e, dir, host) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = panel.getBoundingClientRect();
+        // 居中布局靠 transform 实现，先固化成 left/top 再改尺寸
+        panel.style.transform = "none";
+        panel.style.left = `${rect.left}px`;
+        panel.style.top = `${rect.top}px`;
+        panel.style.width = `${rect.width}px`;
+        panel.style.height = `${rect.height}px`;
+        panelResize = {
+            dir,
+            host,
+            pointerId: e.pointerId,
+            startX: e.clientX,
+            startY: e.clientY,
+            left: rect.left,
+            top: rect.top,
+            width: rect.width,
+            height: rect.height,
+        };
+        host?.setPointerCapture?.(e.pointerId);
+        // 手动拖过尺寸就不再是「吸附态」，下次拖标题栏不该把这次调整覆盖掉
+        snapRestore = null;
+        hideSnapPreview();
+        clearSnapTransition();
+    };
+
+    const onPanelResizeMove = (e) => {
+        if (!panelResize || e.pointerId !== panelResize.pointerId) return;
+        const { dir, startX, startY, left: l0, top: t0, width: w0, height: h0 } = panelResize;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+
+        let left = l0;
+        let top = t0;
+        let width = w0;
+        let height = h0;
+
+        if (dir.includes("e")) width = w0 + dx;
+        if (dir.includes("s")) height = h0 + dy;
+        if (dir.includes("w")) {
+            width = w0 - dx;
+            left = l0 + dx;
+        }
+        if (dir.includes("n")) {
+            height = h0 - dy;
+            top = t0 + dy;
+        }
+
+        // 最小尺寸：拖左 / 上边时钉住对边，让这一侧停住
+        if (width < MIN_PANEL_W) {
+            if (dir.includes("w")) left = l0 + w0 - MIN_PANEL_W;
+            width = MIN_PANEL_W;
+        }
+        if (height < MIN_PANEL_H) {
+            if (dir.includes("n")) top = t0 + h0 - MIN_PANEL_H;
+            height = MIN_PANEL_H;
+        }
+
+        // 左 / 上不能越出视口，越界时钉住右 / 下边缘
+        if (left < 0) {
+            if (dir.includes("w")) width = l0 + w0;
+            left = 0;
+        }
+        if (top < 0) {
+            if (dir.includes("n")) height = t0 + h0;
+            top = 0;
+        }
+
+        // 右边界仍要守（右侧手柄不能跑出视口）；下边界不再主动压高度：
+        // 只有往下拖、还想继续变高时才封顶，已经伸出视口的尺寸不会被反向压矮
+        const maxRight = window.innerWidth - PANEL_MARGIN;
+        const maxBottom = window.innerHeight - PANEL_MARGIN;
+        if (left + width > maxRight) width = Math.max(MIN_PANEL_W, maxRight - left);
+        if (dir.includes("s") && height > h0 && top + height > maxBottom) {
+            height = Math.max(h0, Math.max(MIN_PANEL_H, maxBottom - top));
+        }
+
+        panel.style.left = `${Math.round(left)}px`;
+        panel.style.top = `${Math.round(top)}px`;
+        panel.style.width = `${Math.round(width)}px`;
+        panel.style.height = `${Math.round(height)}px`;
+        applyPanelMaxSize();
+    };
+
+    const endPanelResize = (e) => {
+        if (!panelResize) return;
+        panelResize.host?.releasePointerCapture?.(panelResize.pointerId);
+        panelResize = null;
+        savePanelRect();
+    };
+
+    [
+        ["n", `top: 0; left: ${HANDLE_CORNER}px; right: ${HANDLE_CORNER}px; height: ${HANDLE_THICK}px; cursor: ns-resize;`],
+        ["s", `bottom: 0; left: ${HANDLE_CORNER}px; right: ${HANDLE_CORNER}px; height: ${HANDLE_THICK}px; cursor: ns-resize;`],
+        ["w", `left: 0; top: ${HANDLE_CORNER}px; bottom: ${HANDLE_CORNER}px; width: ${HANDLE_THICK}px; cursor: ew-resize;`],
+        ["e", `right: 0; top: ${HANDLE_CORNER}px; bottom: ${HANDLE_CORNER}px; width: ${HANDLE_THICK}px; cursor: ew-resize;`],
+        ["nw", `left: 0; top: 0; width: ${HANDLE_CORNER}px; height: ${HANDLE_CORNER}px; cursor: nwse-resize;`],
+        ["ne", `right: 0; top: 0; width: ${HANDLE_CORNER}px; height: ${HANDLE_CORNER}px; cursor: nesw-resize;`],
+        ["sw", `left: 0; bottom: 0; width: ${HANDLE_CORNER}px; height: ${HANDLE_CORNER}px; cursor: nesw-resize;`],
+        ["se", `right: 0; bottom: 0; width: ${HANDLE_CORNER}px; height: ${HANDLE_CORNER}px; cursor: nwse-resize;`],
+    ].forEach(([dir, css]) => {
+        const handle = document.createElement("div");
+        handle.dataset.mossResize = dir;
+        handle.style.cssText = `position: absolute; z-index: 30; touch-action: none; ${css}`;
+        handle.addEventListener("pointerdown", (e) => startPanelResize(e, dir, handle));
+        handle.addEventListener("pointermove", onPanelResizeMove);
+        handle.addEventListener("pointerup", endPanelResize);
+        handle.addEventListener("pointercancel", endPanelResize);
+        panel.appendChild(handle);
+    });
+
+    // ================= 贴边吸附（类似 Win 的 Aero Snap）=================
+    const SNAP_EDGE = 10;      // 指针进入距边界多少像素算贴边
+    const SNAP_MIN_MOVE = 8;   // 从吸附态拖出时，移动超过这个距离才恢复原尺寸
+    const SNAP_PREVIEW_DELAY = 280; // 停在边缘多久才亮预览框，避免扫过边界闪一下
+    const SNAP_LAYOUT_MS = 190;     // 松手吸附时展开成目标尺寸的过渡时长
+    let pendingSnap = null;
+    let snapRestore = null;    // 吸附前的矩形，拖出时恢复
+    let snapArmed = true;      // 离开过边界才允许再次吸附，避免刚拖出就被吸回去
+    // 预览状态：换区要重新计时，亮出来之后松手才真正吸附
+    let snapPreviewZone = null;
+    let snapPreviewShown = false;
+    let snapPreviewTimer = null;
+    let snapLayoutTimer = null;
+
+    // ComfyUI 的工作区：优先取 graph canvas，拿不到就退回整个视口
+    const getComfyBounds = () => {
+        const probes = ["#graph-canvas", ".graph-canvas-container", ".comfyui-body"];
+        for (const sel of probes) {
+            let el = null;
+            try {
+                el = document.querySelector(sel);
+            } catch (_) {
+                el = null;
+            }
+            if (!el || typeof el.getBoundingClientRect !== "function") continue;
+            const r = el.getBoundingClientRect();
+            if (r.width >= 200 && r.height >= 200) {
+                return { left: r.left, top: r.top, width: r.width, height: r.height };
+            }
+        }
+        return { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+    };
+
+    // 距离边界三倍阈值就算彻底离开了贴边区，可以解除「刚拖出别立刻吸回去」的抑制
+    const farFromSnapZone = (x, y) => {
+        const b = getComfyBounds();
+        return y > b.top + SNAP_EDGE * 3
+            && x > b.left + SNAP_EDGE * 3
+            && x < b.left + b.width - SNAP_EDGE * 3;
+    };
+
+    const computeSnap = (x, y) => {
+        const b = getComfyBounds();
+        // 吸附目标也要守住视口边界，否则右侧 / 底部会多出几像素被 max-* 压掉
+        const fit = (left, top, width, height) => ({
+            left,
+            top,
+            width: Math.min(width, window.innerWidth - left - PANEL_MARGIN),
+            height: Math.min(height, window.innerHeight - top - PANEL_MARGIN),
+        });
+        const nearTop = y <= b.top + SNAP_EDGE;
+        const nearLeft = x <= b.left + SNAP_EDGE;
+        const nearRight = x >= b.left + b.width - SNAP_EDGE;
+        // 顶部三段优先：角落同时命中时按顶部的分栏处理
+        if (nearTop) {
+            const third = b.width / 3;
+            const rel = (x - b.left) / b.width;
+            if (rel < 1 / 3) return { ...fit(b.left, b.top, third * 2, b.height), zone: "top-left" };
+            if (rel < 2 / 3) return { ...fit(b.left + third / 2, b.top, third * 2, b.height), zone: "top-mid" };
+            return { ...fit(b.left + third, b.top, third * 2, b.height), zone: "top-right" };
+        }
+        if (nearLeft) return { ...fit(b.left, b.top, b.width / 2, b.height), zone: "left" };
+        if (nearRight) return { ...fit(b.left + b.width / 2, b.top, b.width / 2, b.height), zone: "right" };
+        return null;
+    };
+
+    const snapPreview = document.createElement("div");
+    snapPreview.className = "moss-snap-preview";
+    snapPreview.style.cssText =
+        "position: fixed; pointer-events: none; z-index: 9998; display: none; box-sizing: border-box; background: rgba(74, 158, 255, 0.14); border: 1px solid rgba(74, 158, 255, 0.75); border-radius: 8px; transition: left 90ms ease, top 90ms ease, width 90ms ease, height 90ms ease;";
+    document.body.appendChild(snapPreview);
+
+    const showSnapPreview = (snap) => {
+        const wasHidden = snapPreview.style.display !== "block";
+        snapPreview.style.display = "block";
+        snapPreview.style.left = `${snap.left}px`;
+        snapPreview.style.top = `${snap.top}px`;
+        snapPreview.style.width = `${snap.width}px`;
+        snapPreview.style.height = `${snap.height}px`;
+        // 从无到有时轻微放大一下，配合延迟出现，像“落定”而不是突然闪出
+        if (wasHidden && typeof snapPreview.animate === "function") {
+            try {
+                snapPreview.animate(
+                    [
+                        { opacity: 0, scale: "0.99" },
+                        { opacity: 1, scale: "1" },
+                    ],
+                    { duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.3, 1)" }
+                );
+            } catch (_) {
+                /* 老浏览器忽略 */
+            }
+        }
+    };
+    const clearSnapPreviewTimer = () => {
+        if (!snapPreviewTimer) return;
+        clearTimeout(snapPreviewTimer);
+        snapPreviewTimer = null;
+    };
+    // 彻底收起：清计时、清区域，下次进边缘重新等
+    const hideSnapPreview = () => {
+        clearSnapPreviewTimer();
+        snapPreviewZone = null;
+        snapPreviewShown = false;
+        snapPreview.style.display = "none";
+    };
+    // 指针还在吸附区里时调用：同区跟随更新，换区重新计时
+    const refreshSnapPreview = (snap) => {
+        if (!snap) {
+            hideSnapPreview();
+            return;
+        }
+        if (snap.zone === snapPreviewZone) {
+            if (snapPreviewShown) showSnapPreview(snap);
+            return;
+        }
+        clearSnapPreviewTimer();
+        snapPreviewZone = snap.zone;
+        snapPreviewShown = false;
+        snapPreview.style.display = "none";
+        snapPreviewTimer = setTimeout(() => {
+            snapPreviewTimer = null;
+            if (!isDraggingPanel || !pendingSnap || pendingSnap.zone !== snapPreviewZone) return;
+            snapPreviewShown = true;
+            showSnapPreview(pendingSnap);
+        }, SNAP_PREVIEW_DELAY);
+    };
+
+    // 吸附时给位置/尺寸加一次过渡，松手不再硬跳；拖动、缩放前必须清掉，否则跟手会滞后
+    const clearSnapTransition = () => {
+        if (snapLayoutTimer) {
+            clearTimeout(snapLayoutTimer);
+            snapLayoutTimer = null;
+        }
+        if (panel.style.transition) panel.style.transition = "";
+    };
+    const startSnapTransition = () => {
+        const ease = "cubic-bezier(0.2, 0.8, 0.3, 1)";
+        panel.style.transition = [
+            `left ${SNAP_LAYOUT_MS}ms ${ease}`,
+            `top ${SNAP_LAYOUT_MS}ms ${ease}`,
+            `width ${SNAP_LAYOUT_MS}ms ${ease}`,
+            `height ${SNAP_LAYOUT_MS}ms ${ease}`,
+        ].join(", ");
+        // 先把起点样式落一帧，否则新值会和起点算在同一帧里，过渡不生效
+        void panel.offsetWidth;
+        if (snapLayoutTimer) clearTimeout(snapLayoutTimer);
+        snapLayoutTimer = setTimeout(() => {
+            snapLayoutTimer = null;
+            panel.style.transition = "";
+            // 过渡中 rect 还是旧值，等落定再存，避免下次打开跳回吸附前的位置
+            savePanelRect();
+        }, SNAP_LAYOUT_MS + 60);
+    };
+
+    const applySnapLayout = (snap) => {
+        const r = panel.getBoundingClientRect();
+        // 已经是吸附态时保留最早那份尺寸，别把吸附后的宽高当成「原尺寸」记下来
+        snapRestore = snapRestore || { left: r.left, top: r.top, width: r.width, height: r.height };
+        // 居中态靠 transform 定位，先固化成像素再撤 transform，不然过渡会从 50% 处先跳一下
+        panel.style.left = `${Math.round(r.left)}px`;
+        panel.style.top = `${Math.round(r.top)}px`;
+        panel.style.width = `${Math.round(r.width)}px`;
+        panel.style.height = `${Math.round(r.height)}px`;
+        panel.style.transform = "none";
+        startSnapTransition();
+        panel.style.left = `${Math.round(snap.left)}px`;
+        panel.style.top = `${Math.round(snap.top)}px`;
+        panel.style.width = `${Math.round(snap.width)}px`;
+        panel.style.height = `${Math.round(snap.height)}px`;
+        applyPanelMaxSize();
+        // 位置/尺寸的持久化交给过渡结束的定时器（此刻 rect 还没走到目标值）
+    };
+
+    // 从吸附态拖出：恢复吸附前的宽高，并让指针停在标题栏的相对位置
+    const restoreFromSnap = (e) => {
+        if (!snapRestore) return false;
+        // 恢复要跟手，不能还带着吸附那一下的过渡
+        clearSnapTransition();
+        const target = snapRestore;
+        snapRestore = null;
+        const rect = panel.getBoundingClientRect();
+        const ratio = rect.width > 0 ? Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)) : 0.5;
+        const offsetY = Math.min(rect.height, Math.max(0, e.clientY - rect.top));
+        panel.style.width = `${target.width}px`;
+        panel.style.height = `${target.height}px`;
+        panel.style.left = `${e.clientX - target.width * ratio}px`;
+        panel.style.top = `${Math.max(0, e.clientY - offsetY)}px`;
+        return true;
+    };
+
     let saveRectTimer = null;
     const queueSavePanelRect = () => {
         if (saveRectTimer) clearTimeout(saveRectTimer);
@@ -2035,7 +2464,14 @@ export function createFloatingPanel(node, jsonWidget) {
     };
     try {
         // CSS resize 拖拽不会触发事件，用尺寸变化监听兜住
-        new ResizeObserver(queueSavePanelRect).observe(panel);
+        new ResizeObserver(() => {
+            // 缩放到边界时兜底收回一次：写样式会再触发观察，丢到下一帧避免 loop 告警
+            const raf = typeof requestAnimationFrame === "function"
+                ? requestAnimationFrame
+                : (fn) => setTimeout(fn, 16);
+            raf(applyPanelMaxSize);
+            queueSavePanelRect();
+        }).observe(panel);
     } catch (_) {
         /* 老浏览器忽略 */
     }
@@ -2082,6 +2518,12 @@ export function createFloatingPanel(node, jsonWidget) {
         panel.style.left = panelStartLeft + "px";
         panel.style.top = panelStartTop + "px";
 
+        pendingSnap = null;
+        snapArmed = true;
+        hideSnapPreview();
+        // 上次吸附的过渡还没跑完就重新抓起时，先落地，别让拖动跟手带延迟
+        clearSnapTransition();
+
         // 核心修复：锁定指针，确保鼠标移出面板依然能收到松开事件
         header.setPointerCapture(e.pointerId);
         e.preventDefault();
@@ -2089,28 +2531,71 @@ export function createFloatingPanel(node, jsonWidget) {
 
     header.addEventListener("pointermove", (e) => {
         if (!isDraggingPanel) return;
+
+        // 从吸附态拖出后，得先离开边界区域才重新允许吸附；
+        // 这样「拖出来再甩到另一侧」不用松手重拖一次
+        if (!snapArmed && farFromSnapZone(e.clientX, e.clientY)) snapArmed = true;
+
+        // 从吸附态拖出：先恢复吸附前的宽高，再把拖动起点对齐到当前指针，避免跳一下
+        if (snapRestore) {
+            const moved = Math.abs(e.clientX - panelStartX) + Math.abs(e.clientY - panelStartY);
+            if (moved > SNAP_MIN_MOVE) {
+                restoreFromSnap(e);
+                // 已经拖到中间就直接允许吸附；还在边界附近则等离开后再解除
+                snapArmed = farFromSnapZone(e.clientX, e.clientY);
+                const r2 = panel.getBoundingClientRect();
+                const p2 = clampPanelPosition(r2.left, r2.top);
+                panel.style.left = `${p2.left}px`;
+                panel.style.top = `${p2.top}px`;
+                panelStartX = e.clientX;
+                panelStartY = e.clientY;
+                panelStartLeft = p2.left;
+                panelStartTop = p2.top;
+                applyPanelMaxSize();
+            }
+        }
+
         const pos = clampPanelPosition(
             panelStartLeft + e.clientX - panelStartX,
             panelStartTop + e.clientY - panelStartY
         );
         panel.style.left = pos.left + "px";
         panel.style.top = pos.top + "px";
+
+        // 贴边预览：先停一小会儿再亮框，松手才真正吸附，避免扫过边缘就闪一片
+        pendingSnap = snapArmed ? computeSnap(e.clientX, e.clientY) : null;
+        refreshSnapPreview(pendingSnap);
     });
 
     header.addEventListener("pointerup", (e) => {
         isDraggingPanel = false;
         header.releasePointerCapture(e.pointerId);
+        // 只有预览真的亮过才算决定吸附：没看到蓝框就松手，不做跳变
+        const snap = snapPreviewShown ? pendingSnap : null;
+        pendingSnap = null;
+        hideSnapPreview();
+        if (snap) {
+            applySnapLayout(snap);
+            return;
+        }
+        // 拖到靠近视口底部时，可用高度变小，把面板收回来再保存
+        applyPanelMaxSize();
         savePanelRect();
     });
 
     // 窗口尺寸变化后，把已经拖出去的面板拉回可见区域
     window.addEventListener("resize", () => {
         if (panel.style.display === "none") return;
-        if (panel.style.transform !== "none") return; // 还没被拖动过，仍是居中布局
+        if (panel.style.transform !== "none") {
+            // 还没被拖动过，位置由 CSS 居中决定，但尺寸上限仍要跟着窗口走
+            applyPanelMaxSize();
+            return;
+        }
         const rect = panel.getBoundingClientRect();
         const pos = clampPanelPosition(rect.left, rect.top);
         panel.style.left = pos.left + "px";
         panel.style.top = pos.top + "px";
+        applyPanelMaxSize();
     });
 
     // --- 核心状态与变量 ---
