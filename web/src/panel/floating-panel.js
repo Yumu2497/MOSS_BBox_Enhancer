@@ -6,6 +6,25 @@ import { createToast } from "./toast.js";
 import { createPresetPanel } from "./preset-panel.js";
 import { getPluginVersion, onPluginVersion } from "../core/version.js";
 import { snapAxisWithAnchors, snapEdgeToTargets, matchTarget } from "../core/bg-snap.js";
+import { getItemsBounds, alignItems, distributeItems } from "../core/box-layout.js";
+import { hsvToHex, hexToHsv } from "../core/color-utils.js";
+import { isOverlapping } from "../core/box-geometry.js";
+import {
+    buildSnapTargets as buildSnapTargetsCore,
+    snapMoveRect as snapMoveRectCore,
+    snapEdge as snapEdgeCore,
+    applyGridSnap,
+} from "../core/box-snap.js";
+import {
+    getVisualBounds as getVisualBoundsCore,
+    applyVisualBounds as applyVisualBoundsCore,
+} from "../core/extreme-box.js";
+import {
+    CLIPBOARD_PREFIX,
+    cloneItemForClipboard,
+    formatClipboardPayload,
+    parseClipboardBoxes,
+} from "../core/box-clipboard.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -1047,47 +1066,6 @@ export function createFloatingPanel(node, jsonWidget) {
     hexRow.appendChild(hexInput);
     colorPopup.appendChild(hexRow);
 
-    // ---- 颜色换算 ----
-    const hsvToHex = (h, s, v) => {
-        const c = v * s;
-        const hp = (((h % 360) + 360) % 360) / 60;
-        const x = c * (1 - Math.abs((hp % 2) - 1));
-        let r = 0, g = 0, b = 0;
-        if (hp < 1) { r = c; g = x; }
-        else if (hp < 2) { r = x; g = c; }
-        else if (hp < 3) { g = c; b = x; }
-        else if (hp < 4) { g = x; b = c; }
-        else if (hp < 5) { r = x; b = c; }
-        else { r = c; b = x; }
-        const m = v - c;
-        const toHex = (n) =>
-            Math.round(Math.max(0, Math.min(1, n + m)) * 255)
-                .toString(16)
-                .padStart(2, "0");
-        return `#${toHex(r)}${toHex(g)}${toHex(b)}`.toUpperCase();
-    };
-
-    const hexToHsv = (hex) => {
-        let raw = String(hex || "").trim().replace(/^#/, "");
-        if (!/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(raw)) return { h: 0, s: 1, v: 1 };
-        if (raw.length === 3) raw = raw.split("").map((c) => c + c).join("");
-        const r = parseInt(raw.slice(0, 2), 16) / 255;
-        const g = parseInt(raw.slice(2, 4), 16) / 255;
-        const b = parseInt(raw.slice(4, 6), 16) / 255;
-        const max = Math.max(r, g, b);
-        const min = Math.min(r, g, b);
-        const d = max - min;
-        let h = 0;
-        if (d !== 0) {
-            if (max === r) h = ((g - b) / d) % 6;
-            else if (max === g) h = (b - r) / d + 2;
-            else h = (r - g) / d + 4;
-            h *= 60;
-            if (h < 0) h += 360;
-        }
-        return { h: Math.round(h), s: max === 0 ? 0 : d / max, v: max };
-    };
-
     const picker = { h: 0, s: 1, v: 1, colorIdx: -1 };
     let pickerDirty = false;
 
@@ -1931,16 +1909,6 @@ export function createFloatingPanel(node, jsonWidget) {
         return { xmin: -w / 2, ymin: -h / 2, xmax: w / 2, ymax: h / 2 };
     };
 
-    const itemsBounds = (list) => {
-        const boxes = list.map((it) => it.bbox);
-        return {
-            xmin: Math.min(...boxes.map((b) => b[1])),
-            xmax: Math.max(...boxes.map((b) => b[3])),
-            ymin: Math.min(...boxes.map((b) => b[0])),
-            ymax: Math.max(...boxes.map((b) => b[2])),
-        };
-    };
-
     // 多选时对齐到选区包围盒，单选或按住 Alt 时对齐到画布
     const alignSelection = (mode, useCanvas) => {
         const indices = getSelectedIndices();
@@ -1948,21 +1916,8 @@ export function createFloatingPanel(node, jsonWidget) {
         if (!items.length) return;
         if (model.active === -1) model.setActive(indices[0]);
 
-        const base = items.length > 1 && !useCanvas ? itemsBounds(items) : canvasBounds();
-        const cx = (base.xmin + base.xmax) / 2;
-        const cy = (base.ymin + base.ymax) / 2;
-
-        items.forEach((item) => {
-            const [ymin, xmin, ymax, xmax] = item.bbox;
-            const w = xmax - xmin;
-            const h = ymax - ymin;
-            if (mode === "left") item.bbox = [ymin, Math.round(base.xmin), ymax, Math.round(base.xmin + w)];
-            else if (mode === "right") item.bbox = [ymin, Math.round(base.xmax - w), ymax, Math.round(base.xmax)];
-            else if (mode === "centerH") item.bbox = [ymin, Math.round(cx - w / 2), ymax, Math.round(cx + w / 2)];
-            else if (mode === "top") item.bbox = [Math.round(base.ymin), xmin, Math.round(base.ymin + h), xmax];
-            else if (mode === "bottom") item.bbox = [Math.round(base.ymax - h), xmin, Math.round(base.ymax), xmax];
-            else if (mode === "centerV") item.bbox = [Math.round(cy - h / 2), xmin, Math.round(cy + h / 2), xmax];
-        });
+        const base = items.length > 1 && !useCanvas ? getItemsBounds(items) : canvasBounds();
+        alignItems(items, mode, base);
         saveEditorChanges();
     };
 
@@ -1972,26 +1927,7 @@ export function createFloatingPanel(node, jsonWidget) {
         const items = indices.map((i) => model.items[i]).filter((it) => it && Array.isArray(it.bbox));
         if (items.length < 3) return;
         if (model.active === -1) model.setActive(indices[0]);
-
-        const isX = axis === "x";
-        const startOf = (it) => (isX ? it.bbox[1] : it.bbox[0]);
-        const sizeOf = (it) => (isX ? it.bbox[3] - it.bbox[1] : it.bbox[2] - it.bbox[0]);
-
-        items.sort((a, b) => startOf(a) - startOf(b));
-        const spanStart = startOf(items[0]);
-        const lastItem = items[items.length - 1];
-        const spanEnd = startOf(lastItem) + sizeOf(lastItem);
-        const totalSize = items.reduce((sum, it) => sum + sizeOf(it), 0);
-        const gap = (spanEnd - spanStart - totalSize) / (items.length - 1);
-
-        let cursor = spanStart + sizeOf(items[0]) + gap;
-        for (let i = 1; i < items.length - 1; i++) {
-            const item = items[i];
-            const size = sizeOf(item);
-            if (isX) item.bbox = [item.bbox[0], Math.round(cursor), item.bbox[2], Math.round(cursor + size)];
-            else item.bbox = [Math.round(cursor), item.bbox[1], Math.round(cursor + size), item.bbox[3]];
-            cursor += size + gap;
-        }
+        distributeItems(items, axis);
         saveEditorChanges();
     };
 
@@ -2680,45 +2616,15 @@ export function createFloatingPanel(node, jsonWidget) {
 
     let snapReady = false;
 
-    // 候选线：画布左中右 / 上中下，加上其他框的三条竖线、三条横线
     const buildSnapTargets = (excludeIndices) => {
         const { w, h } = getCanvasSize();
-        const xs = [-w / 2, 0, w / 2];
-        const ys = [-h / 2, 0, h / 2];
-        const skip = excludeIndices instanceof Set ? excludeIndices : new Set(excludeIndices == null ? [] : [excludeIndices]);
-        const boxes = [];
-        model.items.forEach((item, i) => {
-            if (skip.has(i) || !item || !Array.isArray(item.bbox)) return;
-            const [ymin, xmin, ymax, xmax] = item.bbox;
-            xs.push(xmin, (xmin + xmax) / 2, xmax);
-            ys.push(ymin, (ymin + ymax) / 2, ymax);
-            boxes.push({ xmin, xmax, ymin, ymax });
+        snapTargets = buildSnapTargetsCore({
+            items: model.items,
+            canvasW: w,
+            canvasH: h,
+            exclude: excludeIndices,
         });
-        snapTargets = { xs, ys, boxes, gapsX: collectGaps(boxes, "x"), gapsY: collectGaps(boxes, "y") };
         snapReady = true;
-    };
-
-    // 其他框之间已有的间距，供等距吸附复用
-    const collectGaps = (boxes, axis) => {
-        const out = [];
-        for (let i = 0; i < boxes.length; i++) {
-            for (let j = 0; j < boxes.length; j++) {
-                if (i === j) continue;
-                const a = boxes[i];
-                const b = boxes[j];
-                if (axis === "x") {
-                    if (a.xmax > b.xmin) continue;
-                    if (!(a.ymin < b.ymax && b.ymin < a.ymax)) continue;
-                    out.push(b.xmin - a.xmax);
-                } else {
-                    if (a.ymax > b.ymin) continue;
-                    if (!(a.xmin < b.xmax && b.xmin < a.xmax)) continue;
-                    out.push(b.ymin - a.ymax);
-                }
-            }
-        }
-        // 相同间距只留一份，避免框多时列表膨胀
-        return [...new Set(out.filter((g) => g > 0).map((g) => Math.round(g * 100) / 100))];
     };
 
     // 拖拽真正开始时才构建，此时选中项已经确定，才能把自己排除掉
@@ -2731,152 +2637,37 @@ export function createFloatingPanel(node, jsonWidget) {
     };
 
     const applySnap = (val, isAltPressed, isX) => {
-        if (!isAltPressed && snapMode === "grid") {
-            const { w, h } = getCanvasSize();
-            const offset = isX ? w / 2 : h / 2;
-            // 核心逻辑：以左上角为基准画网格线
-            return Math.round((val + offset) / GRID_SNAP) * GRID_SNAP - offset;
-        }
-        return Math.round(val);
+        const { w, h } = getCanvasSize();
+        return applyGridSnap(val, {
+            isX,
+            grid: GRID_SNAP,
+            canvasW: w,
+            canvasH: h,
+            altKey: isAltPressed,
+            mode: snapMode,
+        });
     };
 
-    // 对象吸附：把当前框的边 / 中线与其他框、画布对齐，返回偏移量与命中的辅助线
-    const nearestSnap = (edges, targets) => {
-        const tol = SNAP_PX / getActualScale();
-        let best = null;
-        edges.forEach((edge) => {
-            targets.forEach((t) => {
-                const d = t - edge;
-                if (Math.abs(d) <= tol && (!best || Math.abs(d) < Math.abs(best.d))) best = { d, pos: t };
-            });
-        });
-        return best;
-    };
-
-    // 等距吸附：夹在两框之间取等距，或与邻居保持其他框之间已有的间距
-    const snapSpacing = (rect, axis) => {
-        const boxes = snapTargets.boxes;
-        if (!boxes.length) return null;
-
-        const isX = axis === "x";
-        const start = isX ? rect.x : rect.y;
-        const size = isX ? rect.w : rect.h;
-        const end = start + size;
-        const crossStart = isX ? rect.y : rect.x;
-        const crossEnd = isX ? rect.y + rect.h : rect.x + rect.w;
-
-        let near = null;
-        let far = null;
-        boxes.forEach((b) => {
-            const bStart = isX ? b.xmin : b.ymin;
-            const bEnd = isX ? b.xmax : b.ymax;
-            const bCrossStart = isX ? b.ymin : b.xmin;
-            const bCrossEnd = isX ? b.ymax : b.xmax;
-            if (!(bCrossStart < crossEnd && crossStart < bCrossEnd)) return;
-            if (bEnd <= start) {
-                if (!near || bEnd > (isX ? near.xmax : near.ymax)) near = b;
-            } else if (bStart >= end) {
-                if (!far || bStart < (isX ? far.xmin : far.ymin)) far = b;
-            }
-        });
-
-        const nearEnd = near ? (isX ? near.xmax : near.ymax) : null;
-        const farStart = far ? (isX ? far.xmin : far.ymin) : null;
-        const at = (crossStart + crossEnd) / 2;
-        const tol = SNAP_PX / getActualScale();
-
-        // 规则一：左右两边都挨着框，让两个间距相等
-        if (near && far) {
-            const free = farStart - nearEnd;
-            if (free > size) {
-                const gap = (free - size) / 2;
-                const target = nearEnd + gap;
-                if (Math.abs(target - start) <= tol) {
-                    return {
-                        delta: target - start,
-                        guides: [
-                            { type: "spacing", axis, from: nearEnd, to: target, at, gap },
-                            { type: "spacing", axis, from: target + size, to: farStart, at, gap },
-                        ],
-                    };
-                }
-            }
-        }
-
-        // 规则二：贴着某个框时，间距等于其他框之间已有的某个间距
-        const gaps = isX ? snapTargets.gapsX : snapTargets.gapsY;
-        let best = null;
-        gaps.forEach((gap) => {
-            if (near) {
-                const target = nearEnd + gap;
-                const d = target - start;
-                if (Math.abs(d) <= tol && (!best || Math.abs(d) < Math.abs(best.delta))) {
-                    best = {
-                        delta: d,
-                        guides: [{ type: "spacing", axis, from: nearEnd, to: target, at, gap }],
-                    };
-                }
-            }
-            if (far) {
-                const target = farStart - gap - size;
-                const d = target - start;
-                if (Math.abs(d) <= tol && (!best || Math.abs(d) < Math.abs(best.delta))) {
-                    best = {
-                        delta: d,
-                        guides: [{ type: "spacing", axis, from: farStart - gap, to: farStart, at, gap }],
-                    };
-                }
-            }
-        });
-        return best;
-    };
-
+    // 对象吸附：边对齐 / 等距的几何计算都在 core/box-snap.js 里
     const snapMoveRect = (rect, altKey) => {
         ensureSnapTargets();
-        if (altKey || snapMode !== "object" || !snapTargets.xs.length) {
-            return { x: rect.x, y: rect.y, guides: [] };
-        }
-
-        const xHit = nearestSnap([rect.x, rect.x + rect.w / 2, rect.x + rect.w], snapTargets.xs);
-        const yHit = nearestSnap([rect.y, rect.y + rect.h / 2, rect.y + rect.h], snapTargets.ys);
-        const xGap = snapSpacing(rect, "x");
-        const yGap = snapSpacing(rect, "y");
-
-        // 边对齐与等距同时命中时，取位移更小的那个
-        const pick = (hit, gap, axisName) => {
-            const edgeD = hit ? hit.d : null;
-            const gapD = gap ? gap.delta : null;
-            if (edgeD !== null && (gapD === null || Math.abs(edgeD) <= Math.abs(gapD))) {
-                return { d: edgeD, guides: [{ axis: axisName, pos: hit.pos }] };
-            }
-            if (gapD !== null) return { d: gapD, guides: gap.guides };
-            return { d: 0, guides: [] };
-        };
-
-        const rx = pick(xHit, xGap, "x");
-        const ry = pick(yHit, yGap, "y");
-        return {
-            x: rect.x + rx.d,
-            y: rect.y + ry.d,
-            guides: [...rx.guides, ...ry.guides],
-        };
+        return snapMoveRectCore(rect, snapTargets, {
+            mode: snapMode,
+            altKey,
+            grid: GRID_SNAP,
+            scale: getActualScale(),
+            snapPx: SNAP_PX,
+        });
     };
 
     const snapEdge = (value, axis, altKey) => {
         ensureSnapTargets();
-        if (altKey || snapMode !== "object") return { value, guide: null };
-        const targets = axis === "x" ? snapTargets.xs : snapTargets.ys;
-        const hit = nearestSnap([value], targets);
-        return hit ? { value: hit.pos, guide: { axis, pos: hit.pos } } : { value, guide: null };
-    };
-
-    const isOverlapping = (r1, r2) => {
-        return !(
-            r1.x + r1.w < r2.x ||
-            r1.x > r2.x + r2.w ||
-            r1.y + r1.h < r2.y ||
-            r1.y > r2.y + r2.h
-        );
+        return snapEdgeCore(value, axis, snapTargets, {
+            mode: snapMode,
+            altKey,
+            scale: getActualScale(),
+            snapPx: SNAP_PX,
+        });
     };
 
     // ================= 撤销 / 重做 =================
@@ -3170,68 +2961,11 @@ export function createFloatingPanel(node, jsonWidget) {
     });
     node._mossPresetCleanup = () => presetPanel.destroy();
 
-    // 🌟 获取视觉上的代理范围（边长 = 当前网格尺寸：16 或 32）
-    const getVisualBounds = (item) => {
-        const [ymin, xmin, ymax, xmax] = item.bbox;
-        const realW = xmax - xmin;
-        const realH = ymax - ymin;
-        // 极小框的视觉代理边长跟随网格尺寸（16 → 16，32 → 32）
-        const T = GRID_SNAP;
-        if (realW >= T && realH >= T) {
-            return { vXmin: xmin, vYmin: ymin, vXmax: xmax, vYmax: ymax, isExtreme: false };
-        }
-
-        // 极小框
-        const half = T / 2;
-        const align = item._align || "center";
-        let vXmin = xmin, vYmin = ymin, vXmax = xmin + T, vYmax = ymin + T;
-
-        if (align === "center") {
-            const cx = (xmin + xmax) / 2;
-            const cy = (ymin + ymax) / 2;
-            vXmin = cx - half; vXmax = cx + half;
-            vYmin = cy - half; vYmax = cy + half;
-        } else if (align === "tl") {
-            vXmin = xmin; vYmin = ymin; vXmax = xmin + T; vYmax = ymin + T;
-        } else if (align === "tr") {
-            vXmin = xmax - T; vYmin = ymin; vXmax = xmax; vYmax = ymin + T;
-        } else if (align === "bl") {
-            vXmin = xmin; vYmin = ymax - T; vXmax = xmin + T; vYmax = ymax;
-        } else if (align === "br") {
-            vXmin = xmax - T; vYmin = ymax - T; vXmax = xmax; vYmax = ymax;
-        }
-
-        return { vXmin, vYmin, vXmax, vYmax, isExtreme: true };
-    };
+    // 🌟 极小框的视觉代理范围：真实 bbox 小于网格时按一个网格大小显示，几何在 core/extreme-box.js
+    const getVisualBounds = (item) => getVisualBoundsCore(item, GRID_SNAP);
 
     // 🌟 将视觉范围反向映射回真实数据
-    const applyVisualBounds = (item, vXmin, vYmin) => {
-        const [ymin, xmin, ymax, xmax] = item.bbox;
-        const realW = xmax - xmin;
-        const realH = ymax - ymin;
-        const T = GRID_SNAP;
-        if (realW >= T && realH >= T) return; // 只有极小框需要反向映射
-
-        const align = item._align || "center";
-        let newXmin = xmin, newYmin = ymin, newXmax = xmax, newYmax = ymax;
-
-        if (align === "center") {
-            const cx = vXmin + T / 2;
-            const cy = vYmin + T / 2;
-            newXmin = cx - realW / 2; newXmax = cx + realW / 2;
-            newYmin = cy - realH / 2; newYmax = cy + realH / 2;
-        } else if (align === "tl") {
-            newXmin = vXmin; newYmin = vYmin; newXmax = vXmin + realW; newYmax = vYmin + realH;
-        } else if (align === "tr") {
-            newXmin = vXmin + T - realW; newYmin = vYmin; newXmax = vXmin + T; newYmax = vYmin + realH;
-        } else if (align === "bl") {
-            newXmin = vXmin; newYmin = vYmin + T - realH; newXmax = vXmin + realW; newYmax = vYmin + T;
-        } else if (align === "br") {
-            newXmin = vXmin + T - realW; newYmin = vYmin + T - realH; newXmax = vXmin + T; newYmax = vYmin + T;
-        }
-
-        item.bbox = [Math.round(newYmin), Math.round(newXmin), Math.round(newYmax), Math.round(newXmax)];
-    };
+    const applyVisualBounds = (item, vXmin, vYmin) => applyVisualBoundsCore(item, vXmin, vYmin, GRID_SNAP);
 
     // 一帧最多重绘一次：高回报率鼠标一帧能发十几个 mousemove
     let drawScheduled = false;
@@ -4577,17 +4311,7 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     // 🌟 框的复制 / 粘贴（Ctrl+C / Ctrl+V）
-    const cloneItemForClipboard = (item) => {
-        const copy = JSON.parse(JSON.stringify(item));
-        Object.keys(copy).forEach((k) => {
-            if (k.startsWith("_")) delete copy[k];
-        });
-        return copy;
-    };
-
-    // 复制时同时写系统剪贴板：带这个前缀的文本才算「我们复制的框」，
-    // 这样「最后复制的是什么」由剪贴板自己决定，不会再被残留的图片抢走粘贴
-    const CLIPBOARD_PREFIX = "moss-bbox:";
+    // 文本协议与克隆逻辑在 core/box-clipboard.js，这里只负责系统剪贴板读写
 
     const fallbackCopyText = (text) => {
         try {
@@ -4615,17 +4339,6 @@ export function createFloatingPanel(node, jsonWidget) {
         fallbackCopyText(text);
     };
 
-    const parseClipboardBoxes = (text) => {
-        if (typeof text !== "string" || !text.startsWith(CLIPBOARD_PREFIX)) return null;
-        try {
-            const data = JSON.parse(text.slice(CLIPBOARD_PREFIX.length));
-            if (!Array.isArray(data)) return null;
-            return data.filter((it) => it && Array.isArray(it.bbox) && it.bbox.length === 4);
-        } catch (e) {
-            return null;
-        }
-    };
-
     const copySelectedBoxes = () => {
         const inRange = (i) => Number.isInteger(i) && i >= 0 && i < model.items.length;
         const selected = Array.from(model.selection).filter(inRange);
@@ -4637,7 +4350,7 @@ export function createFloatingPanel(node, jsonWidget) {
             .filter(Boolean)
             .map(cloneItemForClipboard);
         if (!bboxClipboard.length) return false;
-        writeClipboardText(CLIPBOARD_PREFIX + JSON.stringify(bboxClipboard));
+        writeClipboardText(formatClipboardPayload(bboxClipboard));
         return true;
     };
 
