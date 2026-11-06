@@ -1,3 +1,5 @@
+import { ensureTheme } from "../ui/theme.js";
+
 const ICONS = {
     selectAll: '<rect x="2.5" y="2.5" width="11" height="11" rx="1.5" stroke-dasharray="2.5 2"/>',
     plus: '<path d="M8 3v10M3 8h10"/>',
@@ -24,24 +26,25 @@ let activePopover = null;
 
 function ensureStyle() {
     if (document.getElementById(STYLE_ID)) return;
+    ensureTheme();
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-.moss-ribbon { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; height: 34px; padding: 0 6px; box-sizing: border-box; background: #1e1e1e; border-bottom: 1px solid #333; overflow-x: auto; overflow-y: hidden; }
+.moss-ribbon { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; height: 34px; padding: 0 6px; box-sizing: border-box; background: var(--moss-bg); border-bottom: 1px solid var(--moss-divider); overflow-x: auto; overflow-y: hidden; }
 .moss-ribbon::-webkit-scrollbar { height: 3px; }
-.moss-ribbon::-webkit-scrollbar-thumb { background: #444; border-radius: 2px; }
+.moss-ribbon::-webkit-scrollbar-thumb { background: var(--moss-border); border-radius: 2px; }
 .moss-ribbon-group { display: flex; align-items: center; gap: 1px; flex: 0 0 auto; }
-.moss-ribbon-sep { width: 1px; height: 16px; margin: 0 5px; background: #333; flex: 0 0 auto; }
+.moss-ribbon-sep { width: 1px; height: 16px; margin: 0 5px; background: var(--moss-divider); flex: 0 0 auto; }
 .moss-ribbon-btn { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; padding: 0; border: 1px solid transparent; border-radius: 5px; background: transparent; color: #ccc; cursor: pointer; flex: 0 0 auto; transition: background 0.12s, border-color 0.12s, color 0.12s, opacity 0.12s; }
 .moss-ribbon-btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; pointer-events: none; }
-.moss-ribbon-btn:hover { background: #414141; border-color: #8a8a8a; color: #fff; }
+.moss-ribbon-btn:hover { background: var(--moss-bg-control-hover); border-color: #8a8a8a; color: #fff; }
 .moss-ribbon-btn.is-active { background: #24405e; border-color: #4a9eff; color: #dbe9ff; }
 .moss-ribbon-btn.is-active:hover { background: #2c4c6e; border-color: #6bb0ff; }
 .moss-ribbon-btn:disabled { opacity: 0.35; cursor: default; background: transparent; border-color: transparent; color: #ccc; }
-.moss-ribbon-select { height: 24px; padding: 0 4px; border: 1px solid #444; border-radius: 5px; background: #2a2a2a; color: #ddd; font-size: 11px; outline: none; cursor: pointer; flex: 0 0 auto; }
+.moss-ribbon-select { height: 24px; padding: 0 4px; border: 1px solid var(--moss-border); border-radius: 5px; background: var(--moss-bg-control); color: #ddd; font-size: 11px; outline: none; cursor: pointer; flex: 0 0 auto; }
 .moss-ribbon-select:hover { border-color: #666; color: #fff; }
-.moss-ribbon-tip { position: fixed; z-index: 2147483000; padding: 4px 8px; border-radius: 4px; background: #111; border: 1px solid #444; color: #ddd; font-size: 11px; line-height: 1.4; pointer-events: none; white-space: nowrap; opacity: 0; transition: opacity 0.12s; }
-.moss-popover { position: fixed; z-index: 2147482500; padding: 10px; border: 1px solid #555; border-radius: 8px; background: #1e1e1e; box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55); display: flex; flex-direction: column; gap: 8px; box-sizing: border-box; }
+.moss-ribbon-tip { position: fixed; z-index: 2147483000; padding: 4px 8px; border-radius: 4px; background: #111; border: 1px solid var(--moss-border); color: #ddd; font-size: 11px; line-height: 1.4; pointer-events: none; white-space: nowrap; opacity: 0; transition: opacity 0.12s; }
+.moss-popover { position: fixed; z-index: 2147482500; padding: 10px; border: 1px solid var(--moss-border-strong); border-radius: var(--moss-radius-lg); background: var(--moss-bg); box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55); display: flex; flex-direction: column; gap: 8px; box-sizing: border-box; }
 `;
     document.head.appendChild(style);
 }

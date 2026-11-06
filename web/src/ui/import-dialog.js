@@ -6,6 +6,8 @@
 //   layout = 只换 items / 坐标格式 / 画布尺寸，保留现有主提示词
 // 这里只管弹层与文件框，真正的合并计算在 core/import-layout.js。
 
+import { ensureTheme } from "./theme.js";
+
 export const IMPORT_MODES = [
     {
         id: "full",
@@ -28,22 +30,23 @@ const IMPORT_STYLE_ID = "moss-import-mode-style";
 
 function ensureImportDialogStyle() {
     if (document.getElementById(IMPORT_STYLE_ID)) return;
+    ensureTheme();
     const style = document.createElement("style");
     style.id = IMPORT_STYLE_ID;
     style.textContent = `
 .moss-import-mask { position: fixed; inset: 0; z-index: 2147482600; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.45); font-family: system-ui, "Microsoft YaHei", sans-serif; }
-.moss-import-dialog { width: 360px; max-width: calc(100vw - 32px); box-sizing: border-box; padding: 14px; border: 1px solid #555; border-radius: 8px; background: #1e1e1e; color: #ddd; box-shadow: 0 18px 48px rgba(0, 0, 0, 0.6); }
-.moss-import-title { font-size: 14px; font-weight: 600; color: #eee; }
-.moss-import-sub { margin-top: 4px; font-size: 11px; color: #8a8a8a; line-height: 1.5; }
+.moss-import-dialog { width: 360px; max-width: calc(100vw - 32px); box-sizing: border-box; padding: 14px; border: 1px solid var(--moss-border-strong); border-radius: var(--moss-radius-lg); background: var(--moss-bg); color: var(--moss-text-dim); box-shadow: 0 18px 48px rgba(0, 0, 0, 0.6); }
+.moss-import-title { font-size: 14px; font-weight: 600; color: var(--moss-text); }
+.moss-import-sub { margin-top: 4px; font-size: 11px; color: var(--moss-text-muted); line-height: 1.5; }
 .moss-import-opts { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
-.moss-import-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border: 1px solid #444; border-radius: 6px; background: #262626; color: #ddd; text-align: left; cursor: pointer; font-family: inherit; }
-.moss-import-opt:hover { border-color: #6a9bd8; background: #2c3340; }
-.moss-import-opt:focus-visible { outline: none; border-color: #6a9bd8; background: #2c3340; }
-.moss-import-opt-name { font-size: 12px; color: #eaeaea; }
-.moss-import-opt-desc { font-size: 11px; color: #8f8f8f; line-height: 1.45; }
+.moss-import-opt { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border: 1px solid var(--moss-border); border-radius: var(--moss-radius); background: var(--moss-bg-elevated); color: var(--moss-text-dim); text-align: left; cursor: pointer; font-family: inherit; }
+.moss-import-opt:hover { border-color: var(--moss-accent); background: #2c3340; }
+.moss-import-opt:focus-visible { outline: none; border-color: var(--moss-accent); background: #2c3340; }
+.moss-import-opt-name { font-size: var(--moss-font); color: var(--moss-text); }
+.moss-import-opt-desc { font-size: var(--moss-font-sm); color: var(--moss-text-muted); line-height: 1.45; }
 .moss-import-foot { display: flex; justify-content: flex-end; margin-top: 10px; }
-.moss-import-cancel { padding: 4px 12px; border: 1px solid #555; border-radius: 5px; background: #2a2a2a; color: #bbb; cursor: pointer; font-size: 11px; font-family: inherit; }
-.moss-import-cancel:hover { background: #333; color: #eee; }
+.moss-import-cancel { padding: 4px 12px; border: 1px solid var(--moss-border-strong); border-radius: 5px; background: var(--moss-bg-control); color: var(--moss-text-dim); cursor: pointer; font-size: var(--moss-font-sm); font-family: inherit; }
+.moss-import-cancel:hover { background: var(--moss-bg-control-hover); color: var(--moss-text); }
 `;
     document.head.appendChild(style);
 }

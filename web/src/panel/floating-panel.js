@@ -26,6 +26,7 @@ import {
     parseClipboardBoxes,
 } from "../core/box-clipboard.js";
 import { createResolutionControl, watchWidgetSize } from "../ui/resolution-control.js";
+import { createCard, createSection, createTextarea, createCheckbox, createLabel, createSelect, createInput } from "../ui/kit.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -425,42 +426,25 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     // ================= 右侧栏：主提示词 =================
-    const promptWrapper = document.createElement("div");
-    promptWrapper.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; overflow: hidden;";
-    
-    const promptHeader = document.createElement("div");
-    promptHeader.style.cssText = "display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; font-size: 11px; color: #aaa; border-bottom: 1px solid #333; font-weight: bold; cursor: pointer; user-select: none;";
-    
-    const promptTitle = document.createElement("span");
-    promptTitle.textContent = "📝 主提示词 (摘要)";
-    
-    const toggleIcon = document.createElement("span");
-    toggleIcon.textContent = "▼";
-    toggleIcon.style.cssText = "font-size: 10px; transition: transform 0.2s;";
-    
-    promptHeader.appendChild(promptTitle);
-    promptHeader.appendChild(toggleIcon);
-    
-    const promptTextarea = document.createElement("textarea");
-    promptTextarea.style.cssText = "width: 100%; height: 80px; box-sizing: border-box; background: transparent; color: #eee; border: none; padding: 8px 10px; font-size: 12px; font-family: sans-serif; resize: vertical; outline: none; line-height: 1.4;";
-    promptTextarea.placeholder = "在此输入画面主描述...";
+    const promptCard = createCard({
+        title: "📝 主提示词 (摘要)",
+        collapsible: true,
+        open: true,
+        flush: true,
+    });
+    promptCard.el.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0;";
 
-    // 折叠逻辑
-    let isPromptExpanded = true;
-    promptHeader.onclick = () => {
-        isPromptExpanded = !isPromptExpanded;
-        promptTextarea.style.display = isPromptExpanded ? "block" : "none";
-        promptHeader.style.borderBottom = isPromptExpanded ? "1px solid #333" : "none";
-        toggleIcon.style.transform = isPromptExpanded ? "rotate(0deg)" : "rotate(-90deg)";
-    };
+    const promptTextarea = createTextarea({
+        placeholder: "在此输入画面主描述...",
+        height: 80,
+    });
 
     // 阻止事件冒泡，防止输入时触发画布快捷键或拖拽
     promptTextarea.addEventListener("mousedown", (e) => e.stopPropagation());
     promptTextarea.addEventListener("wheel", (e) => e.stopPropagation());
     promptTextarea.addEventListener("keydown", (e) => e.stopPropagation());
 
-    promptWrapper.appendChild(promptHeader);
-    promptWrapper.appendChild(promptTextarea);
+    promptCard.body.appendChild(promptTextarea);
     
     leftContainer.appendChild(canvasContainer);
 
@@ -1392,96 +1376,61 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // ================= 画布模式（summary.canvas） =================
     // JSON 顶层字段，不属于背景图设置，单独放在工具栏下方
-    const canvasModePanel = document.createElement("div");
-    canvasModePanel.style.cssText =
-        "margin: 8px 10px 0; padding: 8px 10px; border: 1px solid #444; border-radius: 6px; display: flex; align-items: center; gap: 8px; background: #1a1a1a;";
+    const canvasModeSection = createSection({ title: "🧩 画布模式", inline: true });
+    const canvasModePanel = canvasModeSection.el;
 
-    const canvasModeLabel = document.createElement("span");
-    canvasModeLabel.textContent = "🧩 画布模式";
-    canvasModeLabel.style.cssText = "font-size: 12px; color: #aaa; white-space: nowrap;";
-
-    const canvasModeSelect = document.createElement("select");
-    canvasModeSelect.style.cssText =
-        "flex: 1; min-width: 0; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 4px 6px; outline: none; cursor: pointer; font-size: 12px;";
-    [
+    const canvasModeSelect = createSelect([
         { value: "", label: "默认 (不设置)" },
         { value: "single", label: "单图" },
         { value: "multi_panel", label: "多面板/分镜" },
         { value: "collage", label: "拼贴" },
-    ].forEach((opt) => {
-        const o = document.createElement("option");
-        o.value = opt.value;
-        o.textContent = opt.label;
-        canvasModeSelect.appendChild(o);
-    });
-
-    canvasModePanel.appendChild(canvasModeLabel);
-    canvasModePanel.appendChild(canvasModeSelect);
+    ]);
+    canvasModeSelect.style.flex = "1 1 auto";
+    canvasModeSelect.style.padding = "4px 6px";
+    canvasModeSelect.style.fontSize = "12px";
+    canvasModeSection.body.appendChild(canvasModeSelect);
 
     // （原「对齐 / 分布」面板已移除：构图以手操为主，不再占用右栏空间）
 
-    // ================= 极小框控制面板 =================
-    const smallBoxPanel = document.createElement("div");
-    smallBoxPanel.style.cssText = "margin: 8px 10px 0; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
-    
-    const smallBoxTitle = document.createElement("div");
-    smallBoxTitle.textContent = "📐 极小框控制";
-    smallBoxTitle.style.cssText = "font-size: 12px; font-weight: bold; color: #aaa; border-bottom: 1px solid #333; padding-bottom: 4px; margin-bottom: 2px;";
-    smallBoxPanel.appendChild(smallBoxTitle);
+    // ================= 极小框控制 =================
+    const smallBoxSection = createSection({ title: "📐 极小框控制" });
+    const smallBoxPanel = smallBoxSection.el;
 
     const smallBoxRow = document.createElement("div");
-    smallBoxRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; flex-wrap: wrap;";
-    
-    const enableSmallCb = document.createElement("input");
-    enableSmallCb.type = "checkbox";
-    enableSmallCb.style.cssText = "cursor: pointer; accent-color: #4a9eff; margin: 0;";
-    
-    const sizeLabel = document.createElement("span");
-    sizeLabel.textContent = "尺寸:";
-    sizeLabel.style.color = "#aaa";
-    
-    const sizeInput = document.createElement("input");
-    sizeInput.type = "number";
-    sizeInput.min = "1";
-    sizeInput.max = "15";
-    sizeInput.value = "8";
-    sizeInput.style.cssText = "width: 40px; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; text-align: center;";
+    smallBoxRow.style.cssText = "display: flex; align-items: center; gap: 6px; flex-wrap: wrap;";
 
-    // 🌟 新增：对齐方式下拉框
-    const alignSelect = document.createElement("select");
-    alignSelect.style.cssText = "flex: 1; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 2px 4px; outline: none; cursor: pointer; font-size: 11px;";
-    const alignOptions = [
+    const enableSmallCb = createCheckbox();
+
+    const sizeLabel = createLabel("尺寸:");
+
+    const sizeInput = createInput({ type: "number", value: 8, min: 1, max: 15, width: 40 });
+    sizeInput.style.textAlign = "center";
+
+    // 🌟 对齐方式下拉框
+    const alignSelect = createSelect([
         { value: "center", label: "中心" },
         { value: "tl", label: "左上" },
         { value: "tr", label: "右上" },
         { value: "bl", label: "左下" },
-        { value: "br", label: "右下" }
-    ];
-    alignOptions.forEach(opt => {
-        const o = document.createElement("option");
-        o.value = opt.value;
-        o.textContent = opt.label;
-        alignSelect.appendChild(o);
-    });
-    
+        { value: "br", label: "右下" },
+    ]);
+    alignSelect.style.flex = "1 1 auto";
+
     smallBoxRow.appendChild(enableSmallCb);
     smallBoxRow.appendChild(sizeLabel);
     smallBoxRow.appendChild(sizeInput);
-    smallBoxPanel.appendChild(smallBoxRow);
+    smallBoxSection.body.appendChild(smallBoxRow);
 
-    // 🌟 新增：第二行，专门放对齐方式
+    // 🌟 第二行，专门放对齐方式
     const alignRow = document.createElement("div");
-    alignRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 4px;";
-    
-    const alignLabel = document.createElement("span");
-    alignLabel.textContent = "实际坐标位于:";
-    alignLabel.style.color = "#aaa";
-    alignLabel.style.whiteSpace = "nowrap";
-    
+    alignRow.style.cssText = "display: flex; align-items: center; gap: 6px;";
+
+    const alignLabel = createLabel("实际坐标位于:");
+
     alignRow.appendChild(alignLabel);
     alignRow.appendChild(alignSelect);
-    
-    smallBoxPanel.appendChild(alignRow);
+
+    smallBoxSection.body.appendChild(alignRow);
     
     alignSelect.onchange = () => {
         if (model.active === -1) return;
@@ -1560,66 +1509,26 @@ export function createFloatingPanel(node, jsonWidget) {
         drawCanvas();
     };
 
-    // 🌟 背景图控制面板（卡片化包装）
-    const bgPanel = document.createElement("div");
-    bgPanel.style.cssText = "margin: 8px 10px 0; padding: 10px; border: 1px solid #444; border-radius: 6px; display: flex; flex-direction: column; gap: 8px; background: #1a1a1a;";
-    
-    // 添加区域标题
-    // 标题行：标题 + 操控 + 折叠按钮
-    const bgHeader = document.createElement("div");
-    bgHeader.style.cssText =
-        "display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: bold; color: #aaa;" +
-        "border-bottom: 1px solid #333; padding-bottom: 4px; margin-bottom: 2px;";
+    // 🌟 背景图设置
+    const bgSection = createSection({ title: "🖼️ 背景图设置" });
+    const bgPanel = bgSection.el;
+    const bgBody = bgSection.body;
 
-    const bgTitle = document.createElement("span");
-    bgTitle.textContent = "🖼️ 背景图设置";
-    bgTitle.style.cssText = "flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
+    // 标题行右侧的「操控」开关
+    const bgTitle = bgSection.titleEl;
+    bgTitle.style.cssText = "flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
 
     const bgActiveLabel = document.createElement("label");
     bgActiveLabel.style.cssText =
-        "display: flex; align-items: center; gap: 3px; color: #ccc; font-size: 12px; font-weight: normal; cursor: pointer; flex-shrink: 0;";
+        "display: flex; align-items: center; gap: 3px; color: #ccc; font-size: var(--moss-font); font-weight: normal; cursor: pointer; flex-shrink: 0;";
     bgActiveLabel.title = "开启后可在画布上移动 / 拉伸背景图";
-    const bgActiveCb = document.createElement("input");
-    bgActiveCb.type = "checkbox";
+    const bgActiveCb = createCheckbox();
     bgActiveCb.disabled = true;
-    bgActiveCb.style.cssText = "accent-color: #4a9eff; margin: 0;";
     bgActiveCb.onchange = () => { bgActive = bgActiveCb.checked; };
     bgActiveLabel.appendChild(bgActiveCb);
     bgActiveLabel.appendChild(document.createTextNode("操控"));
 
-    const bgCollapseBtn = document.createElement("button");
-    bgCollapseBtn.type = "button";
-    bgCollapseBtn.title = "展开 / 收起背景图设置";
-    bgCollapseBtn.style.cssText =
-        "display: flex; align-items: center; justify-content: center; flex: 0 0 auto;" +
-        "width: 22px; height: 20px; padding: 0; border-radius: 4px; background: #2a2a2a;" +
-        "border: 1px solid #444; cursor: pointer;";
-    // 用 CSS 三角形，比 ▾ 字符大好控制
-    const bgCollapseArrow = document.createElement("span");
-    bgCollapseArrow.style.cssText =
-        "display: block; width: 0; height: 0; border-left: 5px solid transparent;" +
-        "border-right: 5px solid transparent; border-top: 6px solid #bbb;" +
-        "transition: transform 0.15s;";
-    bgCollapseBtn.appendChild(bgCollapseArrow);
-    bgCollapseBtn.onmouseover = () => { bgCollapseBtn.style.background = "#3a3a3a"; };
-    bgCollapseBtn.onmouseout = () => { bgCollapseBtn.style.background = "#2a2a2a"; };
-
-    bgHeader.appendChild(bgTitle);
-    bgHeader.appendChild(bgActiveLabel);
-    bgHeader.appendChild(bgCollapseBtn);
-    bgPanel.appendChild(bgHeader);
-
-    // 正文容器（可折叠）
-    const bgBody = document.createElement("div");
-    bgBody.style.cssText = "display: flex; flex-direction: column; gap: 8px;";
-    bgPanel.appendChild(bgBody);
-
-    bgCollapseBtn.onclick = () => {
-        const collapsed = bgBody.style.display === "none";
-        bgBody.style.display = collapsed ? "flex" : "none";
-        // 展开时箭头朝下，收起时朝右
-        bgCollapseArrow.style.transform = collapsed ? "rotate(0deg)" : "rotate(-90deg)";
-    };
+    bgSection.head.appendChild(bgActiveLabel);
 
     const bgUploadLabel = document.createElement("label");
     bgUploadLabel.style.cssText = "background: #333; color: #ccc; text-align: center; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; border: 1px solid #555; flex: 1; transition: 0.2s;";
@@ -1877,15 +1786,6 @@ export function createFloatingPanel(node, jsonWidget) {
         "display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; overflow-x: hidden; flex: 1; min-width: 0;";
 
     // ================= 顶部工具条：画布 / 背景 / 视图 =================
-    // 面板自带外框，装进弹层后去掉，避免双层描边
-    [canvasModePanel, smallBoxPanel, bgPanel].forEach((el) => {
-        el.style.margin = "0";
-        el.style.border = "none";
-        el.style.background = "transparent";
-        el.style.padding = "0";
-    });
-    bgCollapseBtn.style.display = "none";
-
     const canvasPop = document.createElement("div");
     canvasPop.style.cssText = "display: flex; flex-direction: column; gap: 10px;";
     canvasPop.appendChild(canvasModePanel);
@@ -1988,24 +1888,14 @@ export function createFloatingPanel(node, jsonWidget) {
     ribbon.group([canvasBtn, bgBtn]);
     ribbon.group([undoBtn, redoBtn, resetViewBtn]);
 
-    // ================= 右栏：分辨率选择器（折叠，默认收起） =================
-    const resolutionSection = document.createElement("div");
-    resolutionSection.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0;";
-    const resolutionHead = document.createElement("div");
-    resolutionHead.style.cssText =
-        "display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; font-size: 11px; color: #aaa; font-weight: bold; cursor: pointer; user-select: none;";
-    const resolutionTitle = document.createElement("span");
-    resolutionTitle.textContent = "🖼 分辨率";
-    const resolutionArrow = document.createElement("span");
-    resolutionArrow.textContent = "▸";
-    resolutionArrow.style.cssText = "font-size: 10px; transition: transform 0.2s;";
-    resolutionHead.appendChild(resolutionTitle);
-    resolutionHead.appendChild(resolutionArrow);
-
-    const resolutionBody = document.createElement("div");
-    resolutionBody.style.cssText = "display: none; margin-top: 6px; max-height: 240px; overflow-y: auto;";
+    // ================= 右栏：分辨率选择器（统一卡片组件，默认收起） =================
     // 节点上直接改宽高时，面板里的选择器也要跟着刷新
     watchWidgetSize(node);
+    const resolutionCard = createCard({ title: "🖼 分辨率", collapsible: true, open: false });
+    resolutionCard.el.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0;";
+    resolutionCard.body.style.maxHeight = "260px";
+    resolutionCard.body.style.overflowY = "auto";
+
     const resolutionControl = createResolutionControl({
         node,
         getSize: () => ({
@@ -2026,21 +1916,15 @@ export function createFloatingPanel(node, jsonWidget) {
             // drawCanvas 定义在后面，初始化那次 apply 用下一帧兜住
             setTimeout(() => drawCanvas(), 0);
         },
+        flat: true,
     });
-    resolutionBody.appendChild(resolutionControl.el);
-    resolutionSection.appendChild(resolutionHead);
-    resolutionSection.appendChild(resolutionBody);
+    resolutionCard.body.appendChild(resolutionControl.el);
+    resolutionCard.onToggle((open) => {
+        if (open) resolutionControl.refresh();
+    });
 
-    let isResolutionExpanded = false;
-    resolutionHead.onclick = () => {
-        isResolutionExpanded = !isResolutionExpanded;
-        resolutionBody.style.display = isResolutionExpanded ? "block" : "none";
-        resolutionArrow.textContent = isResolutionExpanded ? "▾" : "▸";
-        if (isResolutionExpanded) resolutionControl.refresh();
-    };
-
-    rightContainer.appendChild(resolutionSection);
-    rightContainer.appendChild(promptWrapper);
+    rightContainer.appendChild(resolutionCard.el);
+    rightContainer.appendChild(promptCard.el);
     rightContainer.appendChild(listArea);
 
     contentContainer.appendChild(rightContainer);

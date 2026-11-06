@@ -1,4 +1,5 @@
 import { BUILTIN_GROUPS } from "./preset-data.js";
+import { ensureTheme } from "../ui/theme.js";
 
 // 提示词预设弹层：点标签只是选中，可多选；点右上角「写入」才落到描述里
 const STYLE_ID = "moss-preset-style";
@@ -9,14 +10,15 @@ const NEW_TYPE = "__moss_new_type__";
 
 function ensureStyle() {
     if (document.getElementById(STYLE_ID)) return;
+    ensureTheme();
     const style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
-.moss-preset-panel { display: flex; flex-direction: column; gap: 8px; width: 100%; max-height: 68vh; font-size: 12px; color: #ddd; box-sizing: border-box; position: relative; }
-.moss-preset-head { display: flex; align-items: center; gap: 8px; padding: 0 0 6px 4px; border-bottom: 1px solid #444; flex: 0 0 auto; }
+.moss-preset-panel { display: flex; flex-direction: column; gap: 8px; width: 100%; max-height: 68vh; font-size: 12px; color: var(--moss-text-dim); box-sizing: border-box; position: relative; }
+.moss-preset-head { display: flex; align-items: center; gap: 8px; margin: 0 -10px; padding: 0 10px 6px 14px; border-bottom: 1px solid var(--moss-border); flex: 0 0 auto; }
 .moss-preset-body { display: flex; flex-direction: column; gap: 8px; flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 2px 0 4px; }
-.moss-preset-title { font-weight: bold; color: #eee; }
-.moss-preset-count { color: #888; font-size: 11px; }
+.moss-preset-title { font-weight: bold; color: var(--moss-text); }
+.moss-preset-count { color: var(--moss-text-muted); font-size: 11px; }
 .moss-preset-preview { display: flex; flex-direction: column; gap: 2px; flex: 0 0 auto; padding: 5px 7px; border: 1px solid #3a3a3a; border-radius: 5px; background: #202020; }
 .moss-preset-preview-line { display: flex; align-items: flex-start; gap: 6px; }
 .moss-preset-preview-hint { display: none; color: #c8a45c; font-size: 11px; line-height: 15px; }

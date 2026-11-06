@@ -11,6 +11,7 @@ import {
     formatMegapixels,
     inferFromSize,
 } from "../core/resolution.js";
+import { createRow, createLabel, createSelect, createInput } from "./kit.js";
 
 const stores = new WeakMap();
 
@@ -56,36 +57,6 @@ export function refreshResolutionUI(node) {
     store.listeners.forEach((fn) => fn(store.state, { external: true }));
 }
 
-const inputStyle =
-    "background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 3px 5px; outline: none; font-size: 11px; box-sizing: border-box;";
-const selectStyle =
-    "background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 3px 4px; outline: none; cursor: pointer; font-size: 11px; box-sizing: border-box;";
-const labelStyle = "color: #999; font-size: 11px; white-space: nowrap;";
-const rowStyle = "display: flex; align-items: center; gap: 6px;";
-
-const makeSelect = (options, style = selectStyle) => {
-    const el = document.createElement("select");
-    el.style.cssText = style;
-    options.forEach((opt) => {
-        const o = document.createElement("option");
-        o.value = String(opt.value);
-        o.textContent = opt.label;
-        el.appendChild(o);
-    });
-    return el;
-};
-
-const makeNumber = (value, min, max, step, width = "64px") => {
-    const el = document.createElement("input");
-    el.type = "number";
-    el.value = String(value);
-    el.min = String(min);
-    el.max = String(max);
-    el.step = String(step);
-    el.style.cssText = inputStyle + `width: ${width};`;
-    return el;
-};
-
 /**
  * 创建一个分辨率选择器。
  * @param {object} opts
@@ -94,28 +65,31 @@ const makeNumber = (value, min, max, step, width = "64px") => {
  * @param {(size:{width:number,height:number}) => void} opts.applySize 写回宽高
  * @param {boolean} [opts.compact]     节点上的紧凑版
  */
-export function createResolutionControl({ node, getSize, applySize, persist, compact = false }) {
+export function createResolutionControl({ node, getSize, applySize, persist, compact = false, flat = false }) {
     const el = document.createElement("div");
     el.className = "moss-resolution";
     el.style.cssText = [
-        "display: flex; flex-direction: column; gap: 6px;",
-        "padding: 8px; border: 1px solid #3a3a3a; border-radius: 6px;",
-        "background: #1a1a1a; color: #ddd; font-size: 11px; box-sizing: border-box;",
-        compact ? "width: 100%;" : "width: 100%; margin: 0;",
+        "display: flex; flex-direction: column; gap: 6px; width: 100%; box-sizing: border-box;",
+        flat
+            ? ""
+            : "padding: 8px; border: 1px solid var(--moss-border); border-radius: var(--moss-radius); background: var(--moss-bg-raised);",
+        "color: var(--moss-text-dim); font-size: var(--moss-font-sm);",
     ].join(" ");
 
     let state = getStore(node).state;
 
     // ---- 标题 ----
-    const title = document.createElement("div");
-    title.textContent = "🖼 分辨率";
-    title.style.cssText =
-        "font-size: 11px; font-weight: bold; color: #aaa; border-bottom: 1px solid #333; padding-bottom: 3px;";
-    el.appendChild(title);
+    if (!flat) {
+        const title = document.createElement("div");
+        title.textContent = "🖼 分辨率";
+        title.style.cssText =
+            "font-size: 11px; font-weight: bold; color: var(--moss-text-dim); border-bottom: 1px solid var(--moss-divider); padding-bottom: 3px;";
+        el.appendChild(title);
+    }
 
     // ---- 图片尺寸覆盖提示 ----
     const hint = document.createElement("div");
-    hint.style.cssText = "color: #8a8a8a; font-size: 10px; line-height: 1.4; display: none;";
+    hint.style.cssText = "color: var(--moss-text-muted); font-size: 10px; line-height: 1.4; display: none;";
     hint.textContent = "执行时会被图片尺寸覆盖";
     el.appendChild(hint);
 
@@ -126,121 +100,75 @@ export function createResolutionControl({ node, getSize, applySize, persist, com
     };
 
     // ---- 模式 ----
-    const modeRow = document.createElement("div");
-    modeRow.style.cssText = rowStyle;
-    const modeLabel = document.createElement("span");
-    modeLabel.textContent = "方式";
-    modeLabel.style.cssText = labelStyle;
-    const modeSelect = makeSelect(
-        [
-            { value: "manual", label: "手动输入" },
-            { value: "pixels", label: "按像素" },
-            { value: "ratio", label: "按比例" },
-        ],
-        selectStyle + "flex: 1;"
-    );
-    modeRow.appendChild(modeLabel);
+    const modeRow = createRow([createLabel("方式")]);
+    const modeSelect = createSelect([
+        { value: "manual", label: "手动输入" },
+        { value: "pixels", label: "按像素" },
+        { value: "ratio", label: "按比例" },
+    ]);
+    modeSelect.style.flex = "1 1 auto";
     modeRow.appendChild(modeSelect);
     el.appendChild(modeRow);
 
     // ---- 比例 ----
-    const ratioRow = document.createElement("div");
-    ratioRow.style.cssText = rowStyle;
-    const ratioLabel = document.createElement("span");
-    ratioLabel.textContent = "宽高比";
-    ratioLabel.style.cssText = labelStyle;
-    const ratioSelect = makeSelect(
-        [
-            ...RATIO_PRESETS.map((r) => ({ value: `${r.w}:${r.h}`, label: `${r.label}` })),
-            { value: "custom", label: "自定义" },
-        ],
-        selectStyle + "flex: 1;"
-    );
-    const customW = makeNumber(1, 1, 999, 1, "48px");
-    const customH = makeNumber(1, 1, 999, 1, "48px");
-    const customColon = document.createElement("span");
-    customColon.textContent = ":";
-    customColon.style.cssText = labelStyle;
+    const ratioLabel = createLabel("宽高比");
+    const ratioRow = createRow([ratioLabel]);
+    const ratioSelect = createSelect([
+        ...RATIO_PRESETS.map((r) => ({ value: `${r.w}:${r.h}`, label: `${r.label}` })),
+        { value: "custom", label: "自定义" },
+    ]);
+    ratioSelect.style.flex = "1 1 auto";
+    const customW = createInput({ type: "number", value: 1, min: 1, max: 999, step: 1, width: 48 });
+    const customH = createInput({ type: "number", value: 1, min: 1, max: 999, step: 1, width: 48 });
+    const customColon = createLabel(":");
     const customWrap = document.createElement("span");
     customWrap.style.cssText = "display: none; align-items: center; gap: 3px;";
     customWrap.appendChild(customW);
     customWrap.appendChild(customColon);
     customWrap.appendChild(customH);
-    ratioRow.appendChild(ratioLabel);
     ratioRow.appendChild(ratioSelect);
     ratioRow.appendChild(customWrap);
     el.appendChild(ratioRow);
 
     // ---- 参数：手动宽高 ----
-    const manualRow = document.createElement("div");
-    manualRow.style.cssText = rowStyle;
-    const manualWLabel = document.createElement("span");
-    manualWLabel.textContent = "宽";
-    manualWLabel.style.cssText = labelStyle;
-    const manualW = makeNumber(1024, 64, 16384, 8, "68px");
-    const manualHLabel = document.createElement("span");
-    manualHLabel.textContent = "高";
-    manualHLabel.style.cssText = labelStyle;
-    const manualH = makeNumber(1024, 64, 16384, 8, "68px");
-    manualRow.appendChild(manualWLabel);
+    const manualRow = createRow([createLabel("宽")]);
+    const manualW = createInput({ type: "number", value: 1024, min: 64, max: 16384, step: 8, width: 68 });
+    const manualH = createInput({ type: "number", value: 1024, min: 64, max: 16384, step: 8, width: 68 });
     manualRow.appendChild(manualW);
-    manualRow.appendChild(manualHLabel);
+    manualRow.appendChild(createLabel("高"));
     manualRow.appendChild(manualH);
     el.appendChild(manualRow);
 
     // ---- 参数：百万像素 ----
-    const pixelsRow = document.createElement("div");
-    pixelsRow.style.cssText = rowStyle;
-    const pixelsLabel = document.createElement("span");
-    pixelsLabel.textContent = "百万像素";
-    pixelsLabel.style.cssText = labelStyle;
-    const mpInput = makeNumber(1, 0.01, 16, 0.1, "72px");
-    const mpUnit = document.createElement("span");
-    mpUnit.textContent = "MP";
-    mpUnit.style.cssText = labelStyle;
-    pixelsRow.appendChild(pixelsLabel);
+    const pixelsRow = createRow([createLabel("百万像素")]);
+    const mpInput = createInput({ type: "number", value: 1, min: 0.01, max: 16, step: 0.1, width: 72 });
     pixelsRow.appendChild(mpInput);
-    pixelsRow.appendChild(mpUnit);
+    pixelsRow.appendChild(createLabel("MP"));
     el.appendChild(pixelsRow);
 
     // ---- 参数：按比例基准 ----
-    const baseRow = document.createElement("div");
-    baseRow.style.cssText = rowStyle;
-    const baseLabel = document.createElement("span");
-    baseLabel.textContent = "基准";
-    baseLabel.style.cssText = labelStyle;
-    const baseSelect = makeSelect(
-        [
-            { value: "width", label: "宽" },
-            { value: "height", label: "高" },
-            { value: "long", label: "长边" },
-        ],
-        selectStyle + "width: 58px;"
-    );
-    const baseValueInput = makeNumber(1024, 64, 16384, 8, "68px");
-    baseRow.appendChild(baseLabel);
+    const baseRow = createRow([createLabel("基准")]);
+    const baseSelect = createSelect([
+        { value: "width", label: "宽" },
+        { value: "height", label: "高" },
+        { value: "long", label: "长边" },
+    ]);
+    baseSelect.style.width = "58px";
+    const baseValueInput = createInput({ type: "number", value: 1024, min: 64, max: 16384, step: 8, width: 68 });
     baseRow.appendChild(baseSelect);
     baseRow.appendChild(baseValueInput);
     el.appendChild(baseRow);
 
     // ---- 倍数 ----
-    const multipleRow = document.createElement("div");
-    multipleRow.style.cssText = rowStyle;
-    const multipleLabel = document.createElement("span");
-    multipleLabel.textContent = "倍数";
-    multipleLabel.style.cssText = labelStyle;
-    const multipleSelect = makeSelect(
-        MULTIPLES.map((m) => ({ value: m, label: String(m) })),
-        selectStyle + "width: 58px;"
-    );
-    multipleRow.appendChild(multipleLabel);
+    const multipleRow = createRow([createLabel("倍数")]);
+    const multipleSelect = createSelect(MULTIPLES.map((m) => ({ value: m, label: String(m) })));
+    multipleSelect.style.width = "58px";
     multipleRow.appendChild(multipleSelect);
     el.appendChild(multipleRow);
 
     // ---- 结果 ----
     const result = document.createElement("div");
-    result.style.cssText =
-        "padding: 4px 6px; background: #242424; border: 1px solid #3a3a3a; border-radius: 4px; text-align: center; color: #ddd; font-size: 11px;";
+    result.className = "moss-readout";
     el.appendChild(result);
 
     // ---- 渲染与写回 ----
