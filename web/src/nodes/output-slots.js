@@ -9,6 +9,8 @@ const EXPECTED_OUTPUTS = {
         ["主提示词", "STRING"],
         ["完整提示词", "STRING"],
         ["边界框", "ARRAY"],
+        ["画布宽度", "INT"],
+        ["画布高度", "INT"],
     ],
     MOSS_BBox_Resizer: [
         ["元素数组", "ARRAY"],

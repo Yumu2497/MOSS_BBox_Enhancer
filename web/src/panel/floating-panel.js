@@ -25,6 +25,7 @@ import {
     formatClipboardPayload,
     parseClipboardBoxes,
 } from "../core/box-clipboard.js";
+import { createResolutionControl, watchWidgetSize } from "../ui/resolution-control.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -1987,6 +1988,58 @@ export function createFloatingPanel(node, jsonWidget) {
     ribbon.group([canvasBtn, bgBtn]);
     ribbon.group([undoBtn, redoBtn, resetViewBtn]);
 
+    // ================= 右栏：分辨率选择器（折叠，默认收起） =================
+    const resolutionSection = document.createElement("div");
+    resolutionSection.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0;";
+    const resolutionHead = document.createElement("div");
+    resolutionHead.style.cssText =
+        "display: flex; justify-content: space-between; align-items: center; padding: 6px 10px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; font-size: 11px; color: #aaa; font-weight: bold; cursor: pointer; user-select: none;";
+    const resolutionTitle = document.createElement("span");
+    resolutionTitle.textContent = "🖼 分辨率";
+    const resolutionArrow = document.createElement("span");
+    resolutionArrow.textContent = "▸";
+    resolutionArrow.style.cssText = "font-size: 10px; transition: transform 0.2s;";
+    resolutionHead.appendChild(resolutionTitle);
+    resolutionHead.appendChild(resolutionArrow);
+
+    const resolutionBody = document.createElement("div");
+    resolutionBody.style.cssText = "display: none; margin-top: 6px; max-height: 240px; overflow-y: auto;";
+    // 节点上直接改宽高时，面板里的选择器也要跟着刷新
+    watchWidgetSize(node);
+    const resolutionControl = createResolutionControl({
+        node,
+        getSize: () => ({
+            width: node.widgets?.find((w) => w.name === "canvas_width")?.value || 1024,
+            height: node.widgets?.find((w) => w.name === "canvas_height")?.value || 1024,
+        }),
+        applySize: ({ width, height }) => {
+            const wW = node.widgets?.find((w) => w.name === "canvas_width");
+            const hW = node.widgets?.find((w) => w.name === "canvas_height");
+            if (wW) {
+                wW.value = width;
+                wW.callback?.(width);
+            }
+            if (hW) {
+                hW.value = height;
+                hW.callback?.(height);
+            }
+            // drawCanvas 定义在后面，初始化那次 apply 用下一帧兜住
+            setTimeout(() => drawCanvas(), 0);
+        },
+    });
+    resolutionBody.appendChild(resolutionControl.el);
+    resolutionSection.appendChild(resolutionHead);
+    resolutionSection.appendChild(resolutionBody);
+
+    let isResolutionExpanded = false;
+    resolutionHead.onclick = () => {
+        isResolutionExpanded = !isResolutionExpanded;
+        resolutionBody.style.display = isResolutionExpanded ? "block" : "none";
+        resolutionArrow.textContent = isResolutionExpanded ? "▾" : "▸";
+        if (isResolutionExpanded) resolutionControl.refresh();
+    };
+
+    rightContainer.appendChild(resolutionSection);
     rightContainer.appendChild(promptWrapper);
     rightContainer.appendChild(listArea);
 

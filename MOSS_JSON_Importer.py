@@ -332,8 +332,8 @@ class MOSS_JSON_Importer:
         }
     
     OUTPUT_NODE = True
-    RETURN_TYPES = ("ARRAY", "STRING", "STRING", "ARRAY")
-    RETURN_NAMES = ("元素数组", "主提示词", "完整提示词", "边界框")
+    RETURN_TYPES = ("ARRAY", "STRING", "STRING", "ARRAY", "INT", "INT")
+    RETURN_NAMES = ("元素数组", "主提示词", "完整提示词", "边界框", "画布宽度", "画布高度")
     FUNCTION = "execute"
     CATEGORY = "MOSS_BBox_Enhancer"
 
@@ -370,7 +370,7 @@ class MOSS_JSON_Importer:
 
         # 提前返回时，也要保证返回 4 个值
         if not layout_json.strip():
-            return {"ui": ui, "result": ([], "", "", [])}
+            return {"ui": ui, "result": ([], "", "", [], canvas_width, canvas_height)}
 
         try:
             data = json.loads(layout_json)
@@ -379,7 +379,7 @@ class MOSS_JSON_Importer:
             print(f"[MOSS Import] JSON 解析失败，按纯文本处理: {e}")
             prompt = layout_json.strip()
             # 因为没有画框，元素数组和边界框都为空，主提示词和完整提示词都是这段纯文本
-            return {"ui": ui, "result": ([], prompt, prompt, [])}
+            return {"ui": ui, "result": ([], prompt, prompt, [], canvas_width, canvas_height)}
 
         # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
         data, draft_w, draft_h = normalize_layout(data, canvas_width, canvas_height)
@@ -502,7 +502,7 @@ class MOSS_JSON_Importer:
         print(f"[MOSS Import] 成功导入 {len(elements)} 个框，主提示词: {len(prompt)} 字符，完整提示词模式: {'JSON' if elements else '纯文本'}")
         
         # 返回：元素数组、主提示词、完整提示词、边界框（带颜色）
-        return {"ui": ui, "result": (elements, prompt, full_prompt, colored_boxes)}
+        return {"ui": ui, "result": (elements, prompt, full_prompt, colored_boxes, canvas_width, canvas_height)}
 
 
 NODE_CLASS_MAPPINGS = {"MOSS_JSON_Importer": MOSS_JSON_Importer}
