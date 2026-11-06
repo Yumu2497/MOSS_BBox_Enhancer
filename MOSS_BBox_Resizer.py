@@ -122,7 +122,12 @@ class MOSS_BBox_Resizer:
 
     @staticmethod
     def _to_pixel_boxes(items, width, height):
-        """映射后的像素框：给官方「创建边界框」或「MOSS 绘制边界框」用。"""
+        """映射后的像素框：给官方「创建边界框」或「MOSS 绘制边界框」用。
+
+        每个框都带 canvas_width / canvas_height，下游据此知道这些像素坐标按多大的
+        画布算出——画面尺寸不同时按差值平移即可。不单独放一个数组项，否则官方
+        CreateBoundingBoxes 会因为它「既不是框、也没有 bbox 字段」直接报错。
+        """
         half_w, half_h = width / 2, height / 2
         boxes = []
         for item in items:
@@ -136,11 +141,21 @@ class MOSS_BBox_Resizer:
             x2, y2 = xmax + half_w, ymax + half_h
             is_text = item.get("label") == "text"
 
+            # 官方 CreateBoundingBoxes 只认画布内的左上角坐标（会按 width/height 归一化），
+            # 负值或超出画布的框会让它算错位置。这里按画布求交集，只保留可见部分；
+            # 完全在画布外的框留零尺寸占位，保证序号和 items 一一对应。
+            vx1, vy1 = max(0.0, x1), max(0.0, y1)
+            vx2, vy2 = min(float(width), x2), min(float(height), y2)
+            if vx2 <= vx1 or vy2 <= vy1:
+                vx1 = vy1 = vx2 = vy2 = 0.0
+
             box = {
-                "x": round(x1),
-                "y": round(y1),
-                "width": round(x2 - x1),
-                "height": round(y2 - y1),
+                "x": round(vx1),
+                "y": round(vy1),
+                "width": round(vx2 - vx1),
+                "height": round(vy2 - vy1),
+                "canvas_width": width,
+                "canvas_height": height,
                 "metadata": {
                     "type": "text" if is_text else "obj",
                     "text": item.get("text", "") if is_text else "",
@@ -254,14 +269,14 @@ class MOSS_BBox_Resizer:
             new_ymax = bottom - new_cy
             new_xmax = right - new_cx
 
-            def clamp(val, min_val, max_val):
-                return max(min_val, min(val, max_val))
-
+            # 不裁剪：布局数据保留真实坐标，超出画布的部分交给渲染端自然裁掉。
+            # 之前的 clamp 会把放大后的框压到画布边界（甚至压成画面角上的退化框），
+            # 导致「new 填不同尺寸、同一个框得到不同结果」。
             item["bbox"] = [
-                math.floor(clamp(new_ymin, -new_cy, new_cy)),
-                math.floor(clamp(new_xmin, -new_cx, new_cx)),
-                math.ceil(clamp(new_ymax, -new_cy, new_cy)),
-                math.ceil(clamp(new_xmax, -new_cx, new_cx))
+                math.floor(new_ymin),
+                math.floor(new_xmin),
+                math.ceil(new_ymax),
+                math.ceil(new_xmax)
             ]
 
         final_data = items if isinstance(data, list) else data
