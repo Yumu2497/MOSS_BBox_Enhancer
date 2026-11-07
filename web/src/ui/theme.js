@@ -180,6 +180,26 @@ export const ensureTheme = () => {
 
 .moss-checkbox { margin: 0; accent-color: var(--moss-accent); cursor: pointer; }
 
+/* 角色行：整行可交互（双击改、右键删），悬浮给一层浅底 */
+.moss-char-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 4px;
+    border-radius: var(--moss-radius-sm);
+    font-size: var(--moss-font-sm);
+    color: var(--moss-text-dim);
+    transition: background 0.12s, color 0.12s;
+}
+.moss-char-row:hover { background: #2f3033; color: var(--moss-text); }
+.moss-char-row > .moss-char-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
 .moss-readout {
     padding: 4px 6px;
     border: 1px solid var(--moss-border);

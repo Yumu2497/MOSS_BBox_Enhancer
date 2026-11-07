@@ -26,7 +26,8 @@ import {
     parseClipboardBoxes,
 } from "../core/box-clipboard.js";
 import { createResolutionControl, watchWidgetSize } from "../ui/resolution-control.js";
-import { createCard, createSection, createTextarea, createCheckbox, createLabel, createSelect, createInput } from "../ui/kit.js";
+import { createCard, createSection, createTextarea, createCheckbox, createLabel, createSelect, createInput, createButton } from "../ui/kit.js";
+import { showCharacterDialog } from "../ui/character-dialog.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -642,6 +643,15 @@ export function createFloatingPanel(node, jsonWidget) {
         "width: 100%; height: 36px; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; padding: 6px; resize: vertical; font-family: sans-serif; box-sizing: border-box; margin-bottom: 8px; display: none; font-size: 12px;";
     editorContainer.appendChild(textLabel);
     editorContainer.appendChild(textArea);
+
+    // 角色下拉：纯文本功能，选中后只改描述前缀，不写 JSON 字段
+    const charLabel = document.createElement("div");
+    charLabel.textContent = "角色";
+    charLabel.style.cssText = "font-size: 11px; color: #888; margin-bottom: 4px;";
+    const charSelect = createSelect([]);
+    charSelect.style.cssText = "width: 100%; margin-bottom: 8px;";
+    editorContainer.appendChild(charLabel);
+    editorContainer.appendChild(charSelect);
 
     // 描述输入框
     const descLabel = document.createElement("div");
@@ -1923,8 +1933,33 @@ export function createFloatingPanel(node, jsonWidget) {
         if (open) resolutionControl.refresh();
     });
 
+    // ================= 右侧栏：角色（纯提示词层面的临时预设） =================
+    // 角色只存在于 node.properties，不进 layout_json；增删只改 summary.caption 文本。
+    const charCard = createCard({
+        title: "🎭 角色",
+        collapsible: true,
+        open: true,
+        bodyClass: "moss-card__body--stack",
+    });
+    charCard.el.style.cssText = "flex: 0 0 auto; margin: 10px 10px 0;";
+
+    const charListEl = document.createElement("div");
+    charListEl.style.cssText = "display: flex; flex-direction: column; gap: 4px;";
+
+    const charEmptyEl = document.createElement("div");
+    charEmptyEl.textContent = "还没有角色";
+    charEmptyEl.style.cssText = "font-size: 11px; color: #666;";
+
+    const charAddBtn = createButton("＋ 增加角色", { small: true });
+    charAddBtn.style.width = "100%";
+
+    charCard.body.appendChild(charListEl);
+    charCard.body.appendChild(charEmptyEl);
+    charCard.body.appendChild(charAddBtn);
+
     rightContainer.appendChild(resolutionCard.el);
     rightContainer.appendChild(promptCard.el);
+    rightContainer.appendChild(charCard.el);
     rightContainer.appendChild(listArea);
 
     contentContainer.appendChild(rightContainer);
@@ -2827,6 +2862,9 @@ export function createFloatingPanel(node, jsonWidget) {
         if (isText && document.activeElement !== textArea) {
             textArea.value = item.text || "";
         }
+
+        // 角色下拉：按描述前缀回显，没有前缀就停在「（不指定）」
+        refreshCharacterSelect();
 
         syncFrameColorRow();
 
@@ -4716,6 +4754,208 @@ export function createFloatingPanel(node, jsonWidget) {
             console.error("[MOSS] 更新主提示词失败:", e);
         }
     });
+
+    // ================= 角色：纯文本层面的临时预设 =================
+    // 角色列表存在 node.properties（跟着工作流走，但**不进** layout_json）；
+    // 增删只改 summary.caption 的文本，选中角色只改框描述的文本前缀。
+    function readCharacters() {
+        const list = node.properties?.moss_characters;
+        if (!Array.isArray(list)) return [];
+        return list.filter((c) => c && typeof c.name === "string" && c.name.trim());
+    }
+
+    function writeCharacters(list) {
+        if (!node.properties) node.properties = {};
+        node.properties.moss_characters = list;
+    }
+
+    function characterLine(c) {
+        const desc = (c.desc || "").trim();
+        return desc ? `${c.name}，${desc}` : c.name;
+    }
+
+    function setPromptText(text) {
+        promptTextarea.value = text;
+        // 复用主提示词的 input 监听，保证 JSON 跟 UI 同步
+        promptTextarea.dispatchEvent(new Event("input"));
+    }
+
+    function addCharacterToPrompt(c) {
+        const line = characterLine(c);
+        const text = promptTextarea.value.replace(/\s+$/, "");
+        setPromptText(text ? `${text}\n\n${line}` : line);
+    }
+
+    function removeCharacterFromPrompt(c) {
+        const line = characterLine(c);
+        const text = promptTextarea.value;
+        const idx = text.indexOf(line);
+        // 用户手改过主提示词、匹配不到就跳过，不误删别的文本
+        if (idx === -1) return;
+        const before = text.slice(0, idx).replace(/\s+$/, "");
+        const after = text.slice(idx + line.length).replace(/^\s+/, "");
+        setPromptText(before && after ? `${before}\n\n${after}` : before || after);
+    }
+
+    // 描述开头是不是某个角色名（中英文逗号都认）
+    function matchCharacter(text) {
+        const src = typeof text === "string" ? text : "";
+        for (const c of readCharacters()) {
+            if (src.startsWith(`${c.name}，`) || src.startsWith(`${c.name},`)) return c.name;
+        }
+        return "";
+    }
+
+    function stripCharacterPrefix(text) {
+        let out = typeof text === "string" ? text : "";
+        for (const c of readCharacters()) {
+            let hit = false;
+            for (const sep of ["，", ","]) {
+                if (out.startsWith(c.name + sep)) {
+                    out = out.slice(c.name.length + 1);
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) break;
+        }
+        return out.replace(/^[\s，,]+/, "");
+    }
+
+    function refreshCharacterSelect() {
+        const list = readCharacters();
+        charSelect.innerHTML = "";
+        const none = document.createElement("option");
+        none.value = "";
+        none.textContent = "（不指定）";
+        charSelect.appendChild(none);
+        list.forEach((c) => {
+            const opt = document.createElement("option");
+            opt.value = c.name;
+            opt.textContent = c.name;
+            charSelect.appendChild(opt);
+        });
+        const item = model.active >= 0 ? model.items[model.active] : null;
+        charSelect.disabled = !item;
+        charSelect.value = item ? matchCharacter(item.caption || "") : "";
+    }
+
+    function deleteCharacterAt(index) {
+        const list = readCharacters();
+        const c = list[index];
+        if (!c) return;
+        writeCharacters(list.filter((_, i) => i !== index));
+        removeCharacterFromPrompt(c);
+        renderCharacterList();
+        refreshCharacterSelect();
+        toast.show(`已删除角色：${c.name}`, 1400);
+    }
+
+    // 改角色时把主提示词里那一行原地替换，不改变它在文中的位置
+    function replaceCharacterInPrompt(oldC, newC) {
+        const oldLine = characterLine(oldC);
+        const newLine = characterLine(newC);
+        const text = promptTextarea.value;
+        const idx = text.indexOf(oldLine);
+        if (idx === -1) {
+            addCharacterToPrompt(newC);
+            return;
+        }
+        setPromptText(text.slice(0, idx) + newLine + text.slice(idx + oldLine.length));
+    }
+
+    async function editCharacterAt(index) {
+        const current = readCharacters()[index];
+        if (!current) return;
+        const result = await showCharacterDialog({
+            name: current.name,
+            desc: current.desc,
+            title: "修改角色",
+            subtitle: "改完会替换主提示词里对应的那一行。",
+        });
+        if (!result) return;
+
+        const list = readCharacters();
+        if (list.some((c, i) => i !== index && c.name === result.name)) {
+            toast.show(`角色「${result.name}」已存在`, 1600);
+            return;
+        }
+        const old = list[index];
+        list[index] = result;
+        writeCharacters(list);
+        replaceCharacterInPrompt(old, result);
+        renderCharacterList();
+        refreshCharacterSelect();
+        toast.show(`已更新角色：${result.name}`, 1400);
+    }
+
+    function renderCharacterList() {
+        const list = readCharacters();
+        charListEl.innerHTML = "";
+        charEmptyEl.style.display = list.length ? "none" : "";
+        list.forEach((c, index) => {
+            const row = document.createElement("div");
+            row.className = "moss-char-row";
+            row.title = "双击修改，右键删除";
+
+            const label = document.createElement("span");
+            label.className = "moss-char-name";
+            label.textContent = characterLine(c);
+
+            const edit = createButton("✎", { icon: true, title: "修改角色" });
+            edit.onclick = (e) => {
+                e.stopPropagation();
+                editCharacterAt(index);
+            };
+
+            const del = createButton("×", { icon: true, title: "删除角色" });
+            del.onclick = (e) => {
+                e.stopPropagation();
+                deleteCharacterAt(index);
+            };
+
+            row.addEventListener("dblclick", () => editCharacterAt(index));
+            row.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                deleteCharacterAt(index);
+            });
+
+            row.appendChild(label);
+            row.appendChild(edit);
+            row.appendChild(del);
+            charListEl.appendChild(row);
+        });
+    }
+
+    // 选中角色：把「角色名，」插到描述最前面，换角色时替换掉旧前缀
+    charSelect.onchange = () => {
+        const name = charSelect.value;
+        const item = model.active >= 0 ? model.items[model.active] : null;
+        if (!item) return;
+        const rest = stripCharacterPrefix(item.caption || "");
+        item.caption = name ? (rest ? `${name}，${rest}` : name) : rest;
+        descArea.value = item.caption;
+        saveEditorChanges();
+    };
+
+    charAddBtn.onclick = async () => {
+        const result = await showCharacterDialog();
+        if (!result) return;
+        const list = readCharacters();
+        if (list.some((c) => c.name === result.name)) {
+            toast.show(`角色「${result.name}」已存在`, 1600);
+            return;
+        }
+        writeCharacters([...list, result]);
+        addCharacterToPrompt(result);
+        renderCharacterList();
+        refreshCharacterSelect();
+        toast.show(`已添加角色：${result.name}`, 1400);
+    };
+
+    renderCharacterList();
+    refreshCharacterSelect();
 
     // 🌟 监听下拉框变化，写入 JSON
     canvasModeSelect.onchange = () => {
