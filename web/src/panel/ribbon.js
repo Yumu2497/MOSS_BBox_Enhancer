@@ -108,6 +108,8 @@ export function openPopover(anchor, content, { width = 0 } = {}) {
     activePopover = { anchor, el: pop };
 
     const onDown = (e) => {
+        // 带这个标记的遮罩（弹窗）点进去不算「外部点击」，否则弹窗一开 popover 就没了
+        if (e.target?.closest?.("[data-moss-keep-popover]")) return;
         if (pop.contains(e.target) || anchor.contains(e.target)) return;
         closePopover();
     };

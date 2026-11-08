@@ -200,6 +200,35 @@ export const ensureTheme = () => {
     white-space: nowrap;
 }
 
+/* 主提示词模板条目：两行（名字 + 预览），整条可点 */
+.moss-tpl-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 5px 6px;
+    border-radius: var(--moss-radius-sm);
+    cursor: pointer;
+    transition: background 0.12s;
+}
+.moss-tpl-item:hover { background: #2f3033; }
+.moss-tpl-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.moss-tpl-title {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--moss-font-sm);
+    color: var(--moss-text);
+}
+.moss-tpl-preview {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    color: var(--moss-text-muted);
+}
+
 .moss-readout {
     padding: 4px 6px;
     border: 1px solid var(--moss-border);

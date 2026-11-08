@@ -28,6 +28,7 @@ import {
 import { createResolutionControl, watchWidgetSize } from "../ui/resolution-control.js";
 import { createCard, createSection, createTextarea, createCheckbox, createLabel, createSelect, createInput, createButton } from "../ui/kit.js";
 import { showCharacterDialog } from "../ui/character-dialog.js";
+import { createPromptTemplatePanel } from "../ui/prompt-template-panel.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
 let bboxClipboard = [];
@@ -446,6 +447,31 @@ export function createFloatingPanel(node, jsonWidget) {
     promptTextarea.addEventListener("keydown", (e) => e.stopPropagation());
 
     promptCard.body.appendChild(promptTextarea);
+
+    // ================= 主提示词模板 =================
+    // 把当前 summary.caption 整段存成模板，点开弹层选一个套用（覆盖 / Shift 追加）。
+    // 标题撑满，让 📚 和折叠三角贴在一起（默认 space-between 会把三个元素均分）
+    promptCard.titleEl.style.cssText =
+        "flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+    const tplBtn = createButton("📚", { icon: true, title: "提示词模板" });
+    promptCard.head.insertBefore(tplBtn, promptCard.head.lastElementChild);
+
+    const tplPanel = createPromptTemplatePanel({
+        getText: () => promptTextarea.value,
+        onToast: (msg) => toast.show(msg, 1600),
+        onApply: (text, { append } = {}) => {
+            const current = promptTextarea.value.trim();
+            setPromptText(append && current ? `${current}\n\n${text}` : text);
+            closePopover();
+            toast.show(append ? "已追加模板" : "已套用模板", 1400);
+        },
+    });
+
+    tplBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await tplPanel.load();
+        openPopover(tplBtn, tplPanel.el, { width: 300 });
+    });
     
     leftContainer.appendChild(canvasContainer);
 
