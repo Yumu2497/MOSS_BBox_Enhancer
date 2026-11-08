@@ -19,6 +19,7 @@ function ensureStyle() {
 .moss-char-field > span { font-size: 11px; color: var(--moss-text-muted); }
 .moss-char-input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--moss-border); border-radius: var(--moss-radius-sm); background: #111; color: var(--moss-text); font-size: 12px; font-family: inherit; outline: none; }
 .moss-char-input:focus { border-color: var(--moss-accent); }
+.moss-char-textarea { min-height: 72px; max-height: 40vh; resize: vertical; line-height: 1.5; }
 .moss-char-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 .moss-char-btn { padding: 4px 12px; border: 1px solid var(--moss-border-strong); border-radius: 5px; background: var(--moss-bg-control); color: var(--moss-text-dim); cursor: pointer; font-size: var(--moss-font-sm); font-family: inherit; }
 .moss-char-btn:hover { background: var(--moss-bg-control-hover); color: var(--moss-text); }
@@ -51,14 +52,19 @@ export function showCharacterDialog({ name = "", desc = "", title: dialogTitle =
         sub.className = "moss-char-sub";
         sub.textContent = subtitle || "会作为一行追加到主提示词末尾，删除角色时同一行一并移除。";
 
-        const makeField = (labelText, placeholder, value) => {
+        const makeField = (labelText, placeholder, value, { multiline = false } = {}) => {
             const field = document.createElement("div");
             field.className = "moss-char-field";
             const label = document.createElement("span");
             label.textContent = labelText;
-            const input = document.createElement("input");
-            input.type = "text";
-            input.className = "moss-char-input";
+            const input = document.createElement(multiline ? "textarea" : "input");
+            if (multiline) {
+                input.className = "moss-char-input moss-char-textarea";
+                input.rows = 3;
+            } else {
+                input.type = "text";
+                input.className = "moss-char-input";
+            }
             input.placeholder = placeholder;
             input.value = value;
             field.appendChild(label);
@@ -67,7 +73,9 @@ export function showCharacterDialog({ name = "", desc = "", title: dialogTitle =
         };
 
         const nameField = makeField("角色名", "比如：少女A", name);
-        const descField = makeField("角色描述", "比如：坐姿", desc);
+        const descField = makeField("角色描述", "比如：坐姿（可多行，写入主提示词时会压成一行）", desc, {
+            multiline: true,
+        });
 
         const foot = document.createElement("div");
         foot.className = "moss-char-foot";
@@ -104,6 +112,8 @@ export function showCharacterDialog({ name = "", desc = "", title: dialogTitle =
                 e.stopPropagation();
                 close(null);
             } else if (e.key === "Enter") {
+                // 描述是多行框：Enter 换行，Ctrl/Cmd + Enter 才提交
+                if (e.target === descField.input && !(e.ctrlKey || e.metaKey)) return;
                 e.preventDefault();
                 e.stopPropagation();
                 submit();

@@ -4796,7 +4796,8 @@ export function createFloatingPanel(node, jsonWidget) {
     }
 
     function characterLine(c) {
-        const desc = (c.desc || "").trim();
+        // 描述允许多行，写进主提示词时压成一行，保持「一行一个角色」
+        const desc = (c.desc || "").replace(/\s+/g, " ").trim();
         return desc ? `${c.name}，${desc}` : c.name;
     }
 
