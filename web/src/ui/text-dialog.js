@@ -122,8 +122,14 @@ export function showTemplateDialog({ name = "", text = "", title = "修改模板
         };
         document.addEventListener("keydown", onKey, true);
 
-        mask.addEventListener("click", (e) => {
-            if (e.target === mask) close(null);
+        // 只有「按下」和「松开」都落在遮罩空白处才算点击外部（拖选文本时松手在遮罩上不算）
+        let downOnMask = false;
+        mask.addEventListener("mousedown", (e) => {
+            downOnMask = e.target === mask;
+        });
+        mask.addEventListener("mouseup", (e) => {
+            if (downOnMask && e.target === mask) close(null);
+            downOnMask = false;
         });
         cancelBtn.addEventListener("click", () => close(null));
         okBtn.addEventListener("click", submit);

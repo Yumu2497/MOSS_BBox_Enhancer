@@ -121,8 +121,16 @@ export function showCharacterDialog({ name = "", desc = "", title: dialogTitle =
         };
         document.addEventListener("keydown", onKey, true);
 
-        mask.addEventListener("click", (e) => {
-            if (e.target === mask) close(null);
+        // 只有「按下」和「松开」都落在遮罩空白处才算点击外部。
+        // 用 click 判断会被拖选文本坑到：在输入框里按下、在遮罩上松开，
+        // click 的 target 会变成共同祖先（遮罩），导致输入框被关掉。
+        let downOnMask = false;
+        mask.addEventListener("mousedown", (e) => {
+            downOnMask = e.target === mask;
+        });
+        mask.addEventListener("mouseup", (e) => {
+            if (downOnMask && e.target === mask) close(null);
+            downOnMask = false;
         });
         cancelBtn.addEventListener("click", () => close(null));
         okBtn.addEventListener("click", submit);

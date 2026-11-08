@@ -259,6 +259,9 @@ def draw_boxes(pil, boxes, line_width, show_index, show_label, fallback, offset=
                 if label:
                     draw.text((x1 + 6, label_y), label, fill=color + (255,), font=font)
 
+    # 输入带 alpha 就原样保留（透明背景图）；纯 RGB / 灰度仍输出同样通道数
+    if pil.mode == "RGBA":
+        return Image.alpha_composite(pil, overlay)
     return Image.alpha_composite(pil.convert("RGBA"), overlay).convert("RGB")
 
 
@@ -315,7 +318,13 @@ class MOSS_DrawBBoxes:
         frames = []
         for i in range(image.shape[0]):
             arr = (image[i].detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-            pil = Image.fromarray(arr[..., :3] if arr.shape[-1] >= 3 else arr)
+            # 保留 alpha：RGBA 进来就 RGBA 出去，透明的部分不会被 RGB 转换吃成黑色
+            if arr.shape[-1] == 4:
+                pil = Image.fromarray(arr, mode="RGBA")
+            elif arr.shape[-1] == 3:
+                pil = Image.fromarray(arr, mode="RGB")
+            else:
+                pil = Image.fromarray(arr[..., 0], mode="L")
             # 源画布和实际画面尺寸不同时，按差值把整组框平移回画面中心
             offset = (0.0, 0.0)
             if canvas:
