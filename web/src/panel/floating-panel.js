@@ -5,7 +5,7 @@ import { createRibbon, openPopover, closePopover } from "./ribbon.js";
 import { createToast } from "./toast.js";
 import { createPresetPanel } from "./preset-panel.js";
 import { getPluginVersion, onPluginVersion } from "../core/version.js";
-import { snapAxisWithAnchors, snapEdgeToTargets, matchTarget } from "../core/bg-snap.js";
+import { snapEdgeToTargets, matchTarget } from "../core/bg-snap.js";
 import { getItemsBounds, alignItems, distributeItems } from "../core/box-layout.js";
 import { hsvToHex, hexToHsv } from "../core/color-utils.js";
 import { isOverlapping } from "../core/box-geometry.js";
@@ -28,6 +28,7 @@ import {
 import { createResolutionControl, watchWidgetSize } from "../ui/resolution-control.js";
 import { createCard, createSection, createTextarea, createCheckbox, createLabel, createSelect, createInput, createButton } from "../ui/kit.js";
 import { showCharacterDialog } from "../ui/character-dialog.js";
+import { showTopBanner } from "../ui/top-banner.js";
 import { createPromptTemplatePanel } from "../ui/prompt-template-panel.js";
 
 // 框的复制/粘贴缓冲（模块级，可在不同节点的面板之间通用）
@@ -45,7 +46,8 @@ export function createFloatingPanel(node, jsonWidget) {
     let bgInitialState = null;
     let bgSource = "none"; // 'manual' | 'auto'
 
-    // 拖动背景图时是否吸附画布边缘/中心（面板里的“吸附”勾选框控制）
+    // 背景图拖动时是否吸附：跟随顶部「无吸附 / 对象吸附 / 网格吸附」，
+    // 这里是背景图自己的总开关（面板里的“吸附”勾选框），取消后自由拖动
     let bgSnap = true;
     // 背景图吸附命中的辅助线（和框的吸附同一套视觉：蓝色虚线）
     let bgSnapGuides = [];
@@ -1616,6 +1618,218 @@ export function createFloatingPanel(node, jsonWidget) {
     bgUploadRow.appendChild(bgPasteBtn);
     bgBody.appendChild(bgUploadRow);
 
+    // 🌟 从背景图识别人体部位（YOLO pose → 部位矩形）
+    const bgDetectBtn = document.createElement("button");
+    bgDetectBtn.textContent = "🔍 识别人体部位";
+    bgDetectBtn.title = "识别当前背景图里的人体，按面部 / 肘 / 手 / 胯 / 膝 / 脚生成边界框";
+    bgDetectBtn.style.cssText =
+        "background: #333; color: #ccc; border: 1px solid #555; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; width: 100%; margin-top: 6px; transition: 0.2s;";
+    bgDetectBtn.onmouseover = () => { bgDetectBtn.style.background = "#444"; };
+    bgDetectBtn.onmouseout = () => { bgDetectBtn.style.background = "#333"; };
+    bgDetectBtn.onclick = () => detectPoseFromBackground(bgDetectBtn);
+    bgBody.appendChild(bgDetectBtn);
+
+    // 未导入背景图时的就地提醒：弹层 z-index 远高于画布 toast，用行内文字才不会被盖住
+    const bgDetectHint = document.createElement("div");
+    bgDetectHint.style.cssText =
+        "display: none; margin-top: 5px; padding: 5px 8px; border-radius: 4px; " +
+        "background: rgba(189, 128, 42, 0.16); border: 1px solid rgba(224, 167, 90, 0.5); " +
+        "color: #e6bd80; font-size: 11.5px; line-height: 1.45;";
+    bgBody.appendChild(bgDetectHint);
+
+    let poseHintTimer = null;
+    function flashPoseHint(text) {
+        bgDetectHint.textContent = text;
+        bgDetectHint.style.display = "block";
+        clearTimeout(poseHintTimer);
+        poseHintTimer = setTimeout(() => {
+            bgDetectHint.style.display = "none";
+        }, 3000);
+    }
+
+    // 关节框缩放：只作用于肘、膝、胯这些「按人体高度比例生成」的框；
+    // 脸、手、脚来自关键点/像素，尺寸本来就是量出来的，不受这个滑块影响。
+    let poseScale = 1.0;
+    const bgScaleRow = document.createElement("div");
+    bgScaleRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 6px;";
+    const bgScaleLabel = document.createElement("span");
+    bgScaleLabel.textContent = "关节框缩放";
+    bgScaleLabel.title = "只影响肘 / 膝 / 胯的框大小；脸、手、脚按关键点生成，不受影响";
+    bgScaleLabel.style.cssText = "color: #aaa; white-space: nowrap;";
+    const bgScaleRange = document.createElement("input");
+    bgScaleRange.type = "range";
+    bgScaleRange.min = "0.5";
+    bgScaleRange.max = "2";
+    bgScaleRange.step = "0.05";
+    bgScaleRange.value = "1";
+    bgScaleRange.style.flex = "1";
+    const bgScaleValue = document.createElement("span");
+    bgScaleValue.textContent = "1.00";
+    bgScaleValue.style.cssText = "color: #aaa; min-width: 34px; text-align: right;";
+    bgScaleRange.oninput = () => {
+        poseScale = parseFloat(bgScaleRange.value);
+        bgScaleValue.textContent = poseScale.toFixed(2);
+    };
+    bgScaleRow.appendChild(bgScaleLabel);
+    bgScaleRow.appendChild(bgScaleRange);
+    bgScaleRow.appendChild(bgScaleValue);
+    bgBody.appendChild(bgScaleRow);
+
+    // 首次使用没有模型时自动下载（检测 97MB + 姿态 219MB），页面顶部显示进度
+    async function ensurePoseModel() {
+        let status = null;
+        try {
+            status = await (await fetch("/moss/pose/status")).json();
+        } catch (_) {
+            return true; // 旧后端没有这个接口，让 /moss/pose 自己处理
+        }
+        if (status?.ready) return true;
+
+        const mb = (n) => (n / 1048576).toFixed(1);
+        const banner = showTopBanner("首次使用：正在准备姿态识别模型…");
+        try {
+            await fetch("/moss/pose/prepare", { method: "POST" });
+        } catch (_) {
+            // 准备接口失败就让下面的识别请求自己触发下载
+        }
+
+        const deadline = Date.now() + 10 * 60 * 1000;
+        while (Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 800));
+            let cur = null;
+            try {
+                cur = await (await fetch("/moss/pose/status")).json();
+            } catch (_) {
+                continue;
+            }
+            if (cur?.ready) {
+                banner.done("姿态模型已就绪，开始识别…");
+                setTimeout(() => banner.close(), 1200);
+                return true;
+            }
+            if (cur?.error) {
+                banner.fail(cur.error);
+                setTimeout(() => banner.close(), 4000);
+                return false;
+            }
+            const total = cur?.total || 0;
+            const got = cur?.downloaded || 0;
+            if (total > 0) {
+                const ratio = Math.max(0, Math.min(1, got / total));
+                banner.update(
+                    `首次使用：正在下载姿态模型 ${Math.min(99, Math.round(ratio * 100))}%` +
+                        `（${mb(got)} / ${mb(total)} MB，只需下载一次）`,
+                    ratio,
+                );
+            } else {
+                banner.update(`首次使用：正在下载 DWPose 模型 ${mb(got)} MB…`);
+            }
+        }
+        banner.fail("模型下载超时，请检查网络后重试");
+        setTimeout(() => banner.close(), 4000);
+        return false;
+    }
+
+    // 识别结果直接写成 items：bbox 用内部格式 [ymin, xmin, ymax, xmax]（相对画布中心）
+    async function detectPoseFromBackground(btn) {
+        if (!bgImage) {
+            flashPoseHint("还没有背景图 · 先点上面的「📁 导入」选一张图片，再点识别");
+            return;
+        }
+        const imgW = bgImage.naturalWidth || bgImage.width;
+        const imgH = bgImage.naturalHeight || bgImage.height;
+        if (!imgW || !imgH) {
+            flashPoseHint("背景图还在加载 · 等一两秒再点识别");
+            return;
+        }
+
+        const label = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "识别中…";
+        try {
+            if (!(await ensurePoseModel())) return;
+
+            // 按原始分辨率转 base64，避免缩放后再识别损失精度
+            const cv = document.createElement("canvas");
+            cv.width = imgW;
+            cv.height = imgH;
+            cv.getContext("2d").drawImage(bgImage, 0, 0, imgW, imgH);
+            const dataUrl = cv.toDataURL("image/jpeg", 0.92);
+
+            const resp = await fetch("/moss/pose", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ image: dataUrl, conf: 0.5, scale: poseScale }),
+            });
+            const result = await resp.json();
+            if (!result?.success) throw new Error(result?.error || "识别失败");
+            if (!result.boxes?.length) {
+                const detected = result.detected ?? result.people;
+                toast.show(
+                    detected
+                        ? `检测到 ${detected} 处，但都没有完整的头/胯，已忽略`
+                        : "没检测到人物",
+                    2600,
+                );
+                return;
+            }
+
+            // 背景图在画布上的摆放：bgX/bgY 是以画布中心为原点的逻辑坐标，
+            // 所以换算出来的 x1/y1 已经是中心坐标，不能再减一次半幅。
+            const left = bgX - bgW / 2;
+            const top = bgY - bgH / 2;
+            const sx = bgW / (result.width || imgW);
+            const sy = bgH / (result.height || imgH);
+
+            const COLORS = ["#ff6b6b", "#4dabf7", "#51cf66", "#ffd43b", "#cc5de8", "#ff922b"];
+            const startIndex = model.items.length;
+            result.boxes.forEach((box) => {
+                const x1 = left + box.x * sx;
+                const y1 = top + box.y * sy;
+                const x2 = x1 + box.width * sx;
+                const y2 = y1 + box.height * sy;
+                model.items.push({
+                    label: "object",
+                    caption: `人物${box.person}，${box.part}`,
+                    bbox: [Math.round(y1), Math.round(x1), Math.round(y2), Math.round(x2)],
+                    color: COLORS[(box.person - 1) % COLORS.length],
+                });
+            });
+
+            model.selection.clear();
+            model.selection.add(startIndex);
+            model.setActive(startIndex);
+            saveEditorChanges({ force: true });
+            renderList(false);
+            syncEditorPanel();
+            listArea.scrollTop = listArea.scrollHeight;
+
+            // 每个人物建一个角色占位（同名复用，重新识别不会堆重复项）
+            for (let i = 1; i <= result.people; i += 1) {
+                const name = `人物${i}`;
+                const list = readCharacters();
+                if (list.some((c) => c.name === name)) continue;
+                list.push({ name, desc: "" });
+                writeCharacters(list);
+                addCharacterToPrompt({ name, desc: "" });
+            }
+            renderCharacterList();
+            refreshCharacterSelect();
+
+            const skipped = (result.detected ?? result.people) - result.people;
+            toast.show(
+                `识别到 ${result.people} 人${skipped > 0 ? `（另有 ${skipped} 个零散检测已忽略）` : ""}，` +
+                    `生成 ${result.boxes.length} 个部位框`,
+                2600,
+            );
+        } catch (err) {
+            toast.show(`识别失败：${err?.message || err}`, 2600);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = label;
+        }
+    }
+
     const bgControlRow = document.createElement("div");
     bgControlRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px;";
     
@@ -1764,7 +1978,7 @@ export function createFloatingPanel(node, jsonWidget) {
     
     const bgSnapLabel = document.createElement("label");
     bgSnapLabel.style.cssText = "display: flex; align-items: center; gap: 4px; color: #ccc; font-size: 12px; cursor: pointer;";
-    bgSnapLabel.title = "勾选：拖动时吸附画布的上/下/左/右边缘与中心；取消：自由拖动";
+    bgSnapLabel.title = "勾选：拖动时按顶部的「对象吸附 / 网格吸附」设置自动对齐（按住 Alt 临时关闭）；取消：背景图自由拖动";
     const bgSnapCb = document.createElement("input");
     bgSnapCb.type = "checkbox";
     bgSnapCb.checked = bgSnap;
@@ -2802,8 +3016,9 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // --- 编辑面板逻辑 ---
     // 写回 JSON 时统一走模块级的 serializeLayout()，字段规则只保留一处
-    const saveEditorChanges = () => {
-        if (model.active === -1 || !model.items[model.active]) return;
+    // force: 没有选中框时也写回（改角色名要批量改多个框的描述）
+    const saveEditorChanges = ({ force = false } = {}) => {
+        if (!force && (model.active === -1 || !model.items[model.active])) return;
 
         model.items.forEach(item => { if ("_isNew" in item) delete item._isNew; });
 
@@ -2827,15 +3042,17 @@ export function createFloatingPanel(node, jsonWidget) {
 
         // 实时更新右侧列表的文本显示（不整体重建列表，防止失去焦点）
         // ⚠️ 必须按类名找：行首现在是拖动柄 span，querySelector("span") 会抓错元素
-        const cbs = listArea.querySelectorAll("input[type='checkbox']");
-        const row = cbs[model.active]?.parentElement;
-        if (row) {
-            const span = row.querySelector(".moss-row-label");
-            const item = model.items[model.active];
-            const text =
-                item.caption || item.desc || `未命名 (${item.label || "object"})`;
-            if (span)
-                span.textContent = `${model.active + 1}. ${text.length > 15 ? text.substring(0, 15) + "..." : text}`;
+        if (model.active >= 0) {
+            const cbs = listArea.querySelectorAll("input[type='checkbox']");
+            const row = cbs[model.active]?.parentElement;
+            if (row) {
+                const span = row.querySelector(".moss-row-label");
+                const item = model.items[model.active];
+                const text =
+                    item.caption || item.desc || `未命名 (${item.label || "object"})`;
+                if (span)
+                    span.textContent = `${model.active + 1}. ${text.length > 15 ? text.substring(0, 15) + "..." : text}`;
+            }
         }
 
         drawCanvas();
@@ -3689,6 +3906,26 @@ export function createFloatingPanel(node, jsonWidget) {
         e.preventDefault();
     });
 
+    // 背景图吸附：跟随顶部「无吸附 / 对象吸附 / 网格吸附」，按住 Alt 临时关闭；
+    // 面板里的「吸附」勾选框是背景图自己的总开关，取消后自由拖动。
+    const snapBgToGrid = (value, isX) => {
+        const { w, h } = getCanvasSize();
+        return applyGridSnap(value, {
+            isX,
+            grid: GRID_SNAP,
+            canvasW: w,
+            canvasH: h,
+            altKey: false,
+            mode: "grid",
+        });
+    };
+
+    // 对象吸附的候选线：画布三线 + 所有框的边/中线（背景图不参与，所以不排除任何框）
+    const bgSnapLines = () => {
+        const { w: canvasW, h: canvasH } = getCanvasSize();
+        return buildSnapTargetsCore({ items: model.items, canvasW, canvasH, exclude: null });
+    };
+
     window.addEventListener("mousemove", (e) => {
         const rect = getCanvasRect();
         const mouseX = e.clientX - rect.left;
@@ -3709,25 +3946,29 @@ export function createFloatingPanel(node, jsonWidget) {
             let nx = bgStartBBox.x, ny = bgStartBBox.y, nw = bgStartBBox.w, nh = bgStartBBox.h;
             bgSnapGuides = [];
 
+            const canSnap = bgSnap && !e.altKey && snapMode !== "none";
+            const snapLines = canSnap && snapMode === "object" ? bgSnapLines() : null;
+
             if (bgDragMode === "move") {
                 nx += dx;
                 ny += dy;
 
-                // 🌟 吸附到画布：左/中/右、上/中/下（仅在勾选“吸附”时生效）
-                if (bgSnap) {
-                    const snapThreshold = 8 / getActualScale();
-                    const { w: canvasW, h: canvasH } = getCanvasSize();
-                    const xTargets = [-canvasW / 2, 0, canvasW / 2];
-                    const yTargets = [-canvasH / 2, 0, canvasH / 2];
-
-                    // 用三个锚点（起始边 / 中心 / 结束边）里最近的那个去吸附
-                    const snappedX = snapAxisWithAnchors(nx, nw, xTargets, snapThreshold);
-                    const snappedY = snapAxisWithAnchors(ny, nh, yTargets, snapThreshold);
-                    nx = snappedX.pos;
-                    ny = snappedY.pos;
-                    // 命中的是画布的哪条线，就在那条线上画虚线（和框的吸附一致）
-                    addBgGuide("x", snappedX.target);
-                    addBgGuide("y", snappedY.target);
+                if (canSnap && snapMode === "grid") {
+                    // 网格吸附：按左上角对齐网格线，尺寸不变
+                    nx = snapBgToGrid(nx - nw / 2, true) + nw / 2;
+                    ny = snapBgToGrid(ny - nh / 2, false) + nh / 2;
+                } else if (canSnap && snapLines) {
+                    // 对象吸附：画布三线 + 每个框的边/中线，含等距
+                    const snapped = snapMoveRectCore(
+                        { x: nx - nw / 2, y: ny - nh / 2, w: nw, h: nh },
+                        snapLines,
+                        { mode: "object", altKey: false, grid: GRID_SNAP, scale: getActualScale(), snapPx: SNAP_PX },
+                    );
+                    nx = snapped.x + nw / 2;
+                    ny = snapped.y + nh / 2;
+                    snapped.guides.forEach((g) => {
+                        if (g.axis) addBgGuide(g.axis, g.pos);
+                    });
                 }
             } else {
                 const startL = bgStartBBox.x - bgStartBBox.w / 2;
@@ -3741,17 +3982,18 @@ export function createFloatingPanel(node, jsonWidget) {
                 if (bgDragMode.includes("t")) T = startT + dy;
                 if (bgDragMode.includes("b")) B = startB + dy;
 
-                // 🌟 吸附：拖动的这条边靠近画布边缘/中心时自动对齐（和平移吸附同一开关）
-                if (bgSnap) {
-                    const { w: canvasW, h: canvasH } = getCanvasSize();
-                    const snapThr = 8 / getActualScale();
-                    const xTargets = [-canvasW / 2, 0, canvasW / 2];
-                    const yTargets = [-canvasH / 2, 0, canvasH / 2];
-
-                    if (bgDragMode.includes("l")) L = snapEdgeToTargets(L, xTargets, snapThr).value;
-                    if (bgDragMode.includes("r")) R = snapEdgeToTargets(R, xTargets, snapThr).value;
-                    if (bgDragMode.includes("t")) T = snapEdgeToTargets(T, yTargets, snapThr).value;
-                    if (bgDragMode.includes("b")) B = snapEdgeToTargets(B, yTargets, snapThr).value;
+                // 拖边/角：只吸附被拖的那条边
+                if (canSnap && snapMode === "grid") {
+                    if (bgDragMode.includes("l")) L = snapBgToGrid(L, true);
+                    if (bgDragMode.includes("r")) R = snapBgToGrid(R, true);
+                    if (bgDragMode.includes("t")) T = snapBgToGrid(T, false);
+                    if (bgDragMode.includes("b")) B = snapBgToGrid(B, false);
+                } else if (canSnap && snapLines) {
+                    const snapThr = SNAP_PX / getActualScale();
+                    if (bgDragMode.includes("l")) L = snapEdgeToTargets(L, snapLines.xs, snapThr).value;
+                    if (bgDragMode.includes("r")) R = snapEdgeToTargets(R, snapLines.xs, snapThr).value;
+                    if (bgDragMode.includes("t")) T = snapEdgeToTargets(T, snapLines.ys, snapThr).value;
+                    if (bgDragMode.includes("b")) B = snapEdgeToTargets(B, snapLines.ys, snapThr).value;
                 }
 
                 let w = R - L;
@@ -3795,15 +4037,12 @@ export function createFloatingPanel(node, jsonWidget) {
                 nh = Math.abs(B - T);
 
                 // 长宽比联动可能把刚吸附好的边又推开一点，所以按最终位置判断是否还落在目标线上
-                if (bgSnap) {
-                    const { w: cw, h: ch } = getCanvasSize();
-                    const xT = [-cw / 2, 0, cw / 2];
-                    const yT = [-ch / 2, 0, ch / 2];
+                if (canSnap && snapMode === "object" && snapLines) {
                     const markEdge = (value, targets, axis) => addBgGuide(axis, matchTarget(value, targets));
-                    if (bgDragMode.includes("l")) markEdge(nx - nw / 2, xT, "x");
-                    if (bgDragMode.includes("r")) markEdge(nx + nw / 2, xT, "x");
-                    if (bgDragMode.includes("t")) markEdge(ny - nh / 2, yT, "y");
-                    if (bgDragMode.includes("b")) markEdge(ny + nh / 2, yT, "y");
+                    if (bgDragMode.includes("l")) markEdge(nx - nw / 2, snapLines.xs, "x");
+                    if (bgDragMode.includes("r")) markEdge(nx + nw / 2, snapLines.xs, "x");
+                    if (bgDragMode.includes("t")) markEdge(ny - nh / 2, snapLines.ys, "y");
+                    if (bgDragMode.includes("b")) markEdge(ny + nh / 2, snapLines.ys, "y");
                 }
             }
 
@@ -4873,9 +5112,42 @@ export function createFloatingPanel(node, jsonWidget) {
         if (!c) return;
         writeCharacters(list.filter((_, i) => i !== index));
         removeCharacterFromPrompt(c);
+        // 角色没了，框描述开头还挂着「名字，」就成孤儿了，一起去掉
+        const touched = stripCharacterPrefixFromItems(c.name);
         renderCharacterList();
         refreshCharacterSelect();
-        toast.show(`已删除角色：${c.name}`, 1400);
+        toast.show(
+            touched ? `已删除角色：${c.name}，同步清理 ${touched} 个框描述` : `已删除角色：${c.name}`,
+            1600,
+        );
+    }
+
+    // 删角色时清掉框描述开头的「名字，」前缀，只动开头，正文里同名的词不碰
+    function stripCharacterPrefixFromItems(name) {
+        if (!name) return 0;
+        let changed = 0;
+        model.items.forEach((item) => {
+            const text = typeof item.caption === "string" ? item.caption : "";
+            if (!text) return;
+            if (text === name) {
+                item.caption = "";
+                changed += 1;
+                return;
+            }
+            for (const sep of ["，", ","]) {
+                if (text.startsWith(name + sep)) {
+                    item.caption = text.slice(name.length + 1).replace(/^\s+/, "");
+                    changed += 1;
+                    return;
+                }
+            }
+        });
+        if (changed) {
+            saveEditorChanges({ force: true });
+            renderList(false);
+            if (model.active >= 0) syncEditorPanel();
+        }
+        return changed;
     }
 
     // 改角色时把主提示词里那一行原地替换，不改变它在文中的位置
@@ -4891,6 +5163,30 @@ export function createFloatingPanel(node, jsonWidget) {
         setPromptText(text.slice(0, idx) + newLine + text.slice(idx + oldLine.length));
     }
 
+    // 改角色名时，把框描述里以旧名字开头的也一起换掉（只动开头，避免误伤正文里同名的词）
+    function renameCharacterPrefixInItems(oldName, newName) {
+        if (!oldName || !newName || oldName === newName) return 0;
+        let changed = 0;
+        model.items.forEach((item) => {
+            const text = typeof item.caption === "string" ? item.caption : "";
+            if (!text) return;
+            if (text === oldName) {
+                item.caption = newName;
+                changed += 1;
+                return;
+            }
+            for (const sep of ["，", ","]) {
+                if (text.startsWith(oldName + sep)) {
+                    item.caption = newName + sep + text.slice(oldName.length + 1);
+                    changed += 1;
+                    return;
+                }
+            }
+        });
+        if (changed) saveEditorChanges({ force: true });
+        return changed;
+    }
+
     async function editCharacterAt(index) {
         const current = readCharacters()[index];
         if (!current) return;
@@ -4898,7 +5194,7 @@ export function createFloatingPanel(node, jsonWidget) {
             name: current.name,
             desc: current.desc,
             title: "修改角色",
-            subtitle: "改完会替换主提示词里对应的那一行。",
+            subtitle: "改完会替换主提示词里对应的那一行；改名时框描述开头的前缀也会跟着换。",
         });
         if (!result) return;
 
@@ -4911,9 +5207,15 @@ export function createFloatingPanel(node, jsonWidget) {
         list[index] = result;
         writeCharacters(list);
         replaceCharacterInPrompt(old, result);
+        const touched = renameCharacterPrefixInItems(old.name, result.name);
         renderCharacterList();
         refreshCharacterSelect();
-        toast.show(`已更新角色：${result.name}`, 1400);
+        toast.show(
+            touched
+                ? `已更新角色：${result.name}，同步 ${touched} 个框`
+                : `已更新角色：${result.name}`,
+            1600
+        );
     }
 
     function renderCharacterList() {

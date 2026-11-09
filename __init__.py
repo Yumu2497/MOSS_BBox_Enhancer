@@ -10,6 +10,9 @@ from .MOSS_DrawBBoxes import NODE_CLASS_MAPPINGS as DRAW_MAPPINGS, NODE_DISPLAY_
 # 注册用户自定义提示词预设的读写接口（装饰器在导入时生效）
 from . import MOSS_Presets as _MOSS_Presets
 
+# 注册 YOLO 姿态识别接口（/moss/pose，装饰器在导入时生效）
+from . import MOSS_Pose as _MOSS_Pose
+
 # 版本号只有一个来源，前端标题栏通过 GET /moss/version 读取
 from .MOSS_Version import __version__
 

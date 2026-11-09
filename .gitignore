@@ -13,3 +13,6 @@ user_presets.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# 姿态识别模型（DWPose，约 316MB，首次使用自动下载，不进仓库）
+models/

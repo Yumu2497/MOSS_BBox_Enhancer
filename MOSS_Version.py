@@ -9,7 +9,7 @@
 from aiohttp import web
 from server import PromptServer
 
-__version__ = "1.5.16"
+__version__ = "1.6.6"
 
 PACK_NAME = "MOSS_BBox_Enhancer"
 
