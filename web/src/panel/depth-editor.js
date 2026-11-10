@@ -143,6 +143,19 @@ export function createDepthEditor({
     let cropMode = false;
     let cropOp = null;
 
+    // ---------- 重绘节流 ----------
+    // 高回报率鼠标一帧能发十几条 mousemove，每条都整块重绘（底图 + 全部框 + 深度层）
+    // 会明显掉帧。所有交互路径统一走这里：一帧最多画一次，状态在真正画的时候才读，
+    // 所以中途合并掉的那些事件不会丢效果。
+    let redrawRaf = 0;
+    function requestRedraw() {
+        if (!onRedraw || redrawRaf) return;
+        redrawRaf = requestAnimationFrame(() => {
+            redrawRaf = 0;
+            onRedraw();
+        });
+    }
+
     // ---------- 光栅 ----------
 
     function ensureSize(w, h) {
@@ -163,13 +176,31 @@ export function createDepthEditor({
 
     const composeCanvas = document.createElement("canvas");
 
-    // 只拍笔刷层：撤销 / 重做不该把导入的图层一起回滚
-    function rasterUrl() {
-        try {
-            return raster.toDataURL("image/png");
-        } catch (_) {
-            return "";
+    // 撤销快照用 canvas 拷贝，不再 toDataURL：
+    // 1248×832 的 PNG 编码要 10~30ms，每按一次笔都会先顿一下（这是笔刷「卡顿」的主因之一）；
+    // 拷一张同样大小的 canvas 只要 1~2ms，画的时候直接 drawImage 回去，颜色也原样保留。
+    function snapshotOf(src) {
+        const cv = document.createElement("canvas");
+        cv.width = Math.max(1, src.width);
+        cv.height = Math.max(1, src.height);
+        cv.getContext("2d").drawImage(src, 0, 0);
+        return cv;
+    }
+
+    // 快照可能是 canvas（新）或 dataURL 字符串（空闲时压缩过的），两种都认
+    function drawSnapshot(ctx, snap, w, h) {
+        if (!snap) return Promise.resolve();
+        if (typeof snap === "string") {
+            return loadImage(snap)
+                .then((img) => {
+                    ctx.clearRect(0, 0, w, h);
+                    ctx.drawImage(img, 0, 0, w, h);
+                })
+                .catch(() => {});
         }
+        ctx.clearRect(0, 0, w, h);
+        ctx.drawImage(snap, 0, 0, w, h);
+        return Promise.resolve();
     }
 
     // 合成：笔刷层打底，再按顺序盖上可见图层
@@ -241,14 +272,9 @@ export function createDepthEditor({
         };
     }
 
-    function layerUrl(index) {
+    function layerSnapshot(index) {
         const L = layers[index];
-        if (!L) return "";
-        try {
-            return L.canvas.toDataURL("image/png");
-        } catch (_) {
-            return "";
-        }
+        return L ? snapshotOf(L.canvas) : null;
     }
 
     function pushEntry(entry) {
@@ -258,6 +284,30 @@ export function createDepthEditor({
         redoStack.length = 0;
         syncButtons();
         return entry;
+    }
+
+    // 快照先留在内存里当 canvas（快），等浏览器空闲再压成 PNG 字符串（省内存）。
+    // 1M 像素的 canvas 约 4MB，20 步就是 80MB；压完只剩几十 KB。
+    let shrinkTimer = 0;
+    function shrinkEntriesSoon() {
+        clearTimeout(shrinkTimer);
+        shrinkTimer = setTimeout(() => {
+            const run = () => {
+                for (const stack of [undoStack, redoStack]) {
+                    for (const e of stack) {
+                        try {
+                            if (e.type === "stroke" && e.before && typeof e.before !== "string") {
+                                e.before = e.before.toDataURL("image/png");
+                            } else if (e.type === "clear" && e.base && typeof e.base !== "string") {
+                                e.base = e.base.toDataURL("image/png");
+                            }
+                        } catch (_) { /* 压不动就留着 canvas，撤销照样能用 */ }
+                    }
+                }
+            };
+            if (window.requestIdleCallback) window.requestIdleCallback(run, { timeout: 2000 });
+            else run();
+        }, 800);
     }
 
     // 笔刷 / 橡皮 / 填充：只存被改的那一张
@@ -272,11 +322,13 @@ export function createDepthEditor({
 
     function pushStroke() {
         const isLayer = activeLayer >= 0 && !!layers[activeLayer];
-        return pushEntry({
+        const entry = pushEntry({
             type: "stroke",
             target: isLayer ? activeLayer : "base",
-            before: isLayer ? layerUrl(activeLayer) : rasterUrl(),
+            before: isLayer ? layerSnapshot(activeLayer) : snapshotOf(raster),
         });
+        shrinkEntriesSoon();
+        return entry;
     }
 
     function pushAddLayer(index) {
@@ -292,20 +344,24 @@ export function createDepthEditor({
     }
 
     function pushClear() {
-        return pushEntry({
+        const entry = pushEntry({
             type: "clear",
-            base: rasterUrl(),
+            base: snapshotOf(raster),
             layers: layers.map((L) => cloneLayer(L)),
             keys: Array.from(injectedKeys),
         });
+        shrinkEntriesSoon();
+        return entry;
     }
 
     // 撤销时把「当前状态」抓成反向条目，redo 就能用同一套逻辑走回去
     function captureForEntry(entry) {
         switch (entry.type) {
             case "stroke": {
-                const url = entry.target === "base" ? rasterUrl() : layerUrl(entry.target);
-                return url ? { ...entry, before: url } : null;
+                const snap = entry.target === "base"
+                    ? snapshotOf(raster)
+                    : layerSnapshot(entry.target);
+                return snap ? { ...entry, before: snap } : null;
             }
             case "transform": {
                 const L = layers[entry.index];
@@ -326,7 +382,7 @@ export function createDepthEditor({
             case "clear":
                 return {
                     ...entry,
-                    base: rasterUrl(),
+                    base: snapshotOf(raster),
                     layers: layers.map((L) => cloneLayer(L)),
                     keys: Array.from(injectedKeys),
                 };
@@ -340,26 +396,19 @@ export function createDepthEditor({
         syncTools();
         rebuildLayerSelect();
         scheduleCommit();
-        onRedraw?.();
+        requestRedraw();
     }
 
     function applyEntry(entry, dir) {
         switch (entry.type) {
             case "stroke": {
                 if (entry.target === "base") {
-                    loadImage(entry.before).then((img) => {
-                        rctx.clearRect(0, 0, raster.width, raster.height);
-                        rctx.drawImage(img, 0, 0, raster.width, raster.height);
-                        afterRestore();
-                    }).catch(() => {});
+                    drawSnapshot(rctx, entry.before, raster.width, raster.height).then(afterRestore);
                 } else {
                     const L = layers[entry.target];
                     if (!L) return;
-                    loadImage(entry.before).then((img) => {
-                        L.ctx.clearRect(0, 0, L.canvas.width, L.canvas.height);
-                        L.ctx.drawImage(img, 0, 0, L.canvas.width, L.canvas.height);
-                        afterRestore();
-                    }).catch(() => {});
+                    drawSnapshot(L.ctx, entry.before, L.canvas.width, L.canvas.height)
+                        .then(afterRestore);
                 }
                 return;
             }
@@ -403,15 +452,13 @@ export function createDepthEditor({
                 return;
             }
             case "clear": {
-                loadImage(entry.base).then((img) => {
-                    rctx.clearRect(0, 0, raster.width, raster.height);
-                    rctx.drawImage(img, 0, 0, raster.width, raster.height);
+                drawSnapshot(rctx, entry.base, raster.width, raster.height).then(() => {
                     layers = entry.layers.map((L) => cloneLayer(L));
                     activeLayer = layers.length ? layers.length - 1 : -1;
                     injectedKeys.clear();
                     (entry.keys || []).forEach((k) => injectedKeys.add(k));
                     afterRestore();
-                }).catch(() => {});
+                });
                 return;
             }
             default:
@@ -426,6 +473,7 @@ export function createDepthEditor({
         if (cur) redoStack.push(cur);
         applyEntry(entry, "undo");
         syncButtons();
+        shrinkEntriesSoon(); // 反向条目也是 canvas，空闲时一起压掉
     }
 
     function redo() {
@@ -435,6 +483,7 @@ export function createDepthEditor({
         if (cur) undoStack.push(cur);
         applyEntry(entry, "redo");
         syncButtons();
+        shrinkEntriesSoon();
     }
 
     // ---------- 提交 ----------
@@ -446,37 +495,50 @@ export function createDepthEditor({
         if (!onState) return;
         clearTimeout(persistTimer);
         persistTimer = setTimeout(() => {
-            try {
-                onState({
-                    v: 1,
-                    base: raster.toDataURL("image/png"),
-                    layers: layers.map((L) => ({
-                        png: L.canvas.toDataURL("image/png"),
-                        x: L.x,
-                        y: L.y,
-                        w: L.w,
-                        h: L.h,
-                        name: L.name,
-                        key: L.key || "",
-                        crop: L.crop
-                            ? { x: L.crop.x, y: L.crop.y, w: L.crop.w, h: L.crop.h }
-                            : null,
-                    })),
-                });
-            } catch (err) {
-                console.warn("[MOSS] 深度图层保存失败:", err);
-            }
+            if (window.requestIdleCallback) window.requestIdleCallback(encodeState, { timeout: 2500 });
+            else encodeState();
         }, delay);
     }
 
-    function scheduleCommit(delay = 350) {
+    // 把笔刷层和每张图层都 toDataURL 一遍，最重的一步，所以只放在空闲时做
+    function encodeState() {
+        try {
+            onState({
+                v: 1,
+                base: raster.toDataURL("image/png"),
+                layers: layers.map((L) => ({
+                    png: L.canvas.toDataURL("image/png"),
+                    x: L.x,
+                    y: L.y,
+                    w: L.w,
+                    h: L.h,
+                    name: L.name,
+                    key: L.key || "",
+                    crop: L.crop
+                        ? { x: L.crop.x, y: L.crop.y, w: L.crop.w, h: L.crop.h }
+                        : null,
+                })),
+            });
+        } catch (err) {
+            console.warn("[MOSS] 深度图层保存失败:", err);
+        }
+    }
+
+    // 回写 depth_png 要整张合成 + toDataURL（10~30ms），正好卡在抬笔那一刻会明显顿一下。
+    // 所以先等 600ms 确认不再画了，再挑浏览器空闲的时候做；图层结构编码更重，再往后放。
+    function scheduleCommit(delay = 600) {
         clearTimeout(commitTimer);
-        commitTimer = setTimeout(() => {
+        commitTimer = setTimeout(runCommit, delay);
+    }
+
+    function runCommit() {
+        const doIt = () => {
             const url = compositeUrl();
             if (url) onChange?.(url);
-            // 图层结构编码成 base64 有点重，降频：笔刷停了 1.2s 再存一次
-            persistState(1200);
-        }, delay);
+            persistState(900);
+        };
+        if (window.requestIdleCallback) window.requestIdleCallback(doIt, { timeout: 1500 });
+        else doIt();
     }
 
     function flushCommit() {
@@ -569,7 +631,7 @@ export function createDepthEditor({
         syncTools();
         syncCursor();
         dirty = !!state.base || layers.length > 0;
-        onRedraw?.();
+        requestRedraw();
         return true;
     }
 
@@ -911,7 +973,7 @@ export function createDepthEditor({
                     index: activeLayer,
                     before: L.crop ? { ...L.crop } : null,
                 };
-                onRedraw?.();
+                requestRedraw();
                 return true;
             }
             if (p.x >= abs.x && p.x <= abs.x + abs.w
@@ -922,7 +984,7 @@ export function createDepthEditor({
                     index: activeLayer,
                     before: L.crop ? { ...L.crop } : null,
                 };
-                onRedraw?.();
+                requestRedraw();
                 return true;
             }
             return true;
@@ -954,7 +1016,7 @@ export function createDepthEditor({
                     before: { x: cur.x, y: cur.y, w: cur.w, h: cur.h },
                 };
                 syncTools();
-                onRedraw?.();
+                requestRedraw();
                 return true;
             }
             const hit = hitLayer(p.x, p.y);
@@ -982,7 +1044,7 @@ export function createDepthEditor({
                 before: { x: L.x, y: L.y, w: L.w, h: L.h },
             };
             syncTools();
-            onRedraw?.();
+            requestRedraw();
             return true;
         }
 
@@ -993,7 +1055,7 @@ export function createDepthEditor({
         paintTo(p.x, p.y);
         drawing = true;
         hover = { x: p.x - p.w / 2, y: p.y - p.h / 2 };
-        onRedraw?.();
+        requestRedraw();
         return true;
     }
 
@@ -1018,7 +1080,7 @@ export function createDepthEditor({
                         canvas.style.cursor = "crosshair";
                     }
                 }
-                onRedraw?.();
+                requestRedraw();
                 return true;
             }
             const L = layers[activeLayer];
@@ -1041,7 +1103,7 @@ export function createDepthEditor({
                 next = { x: l, y: t, w: rr - l, h: bb - t };
             }
             setCropAbs(L, next);
-            onRedraw?.();
+            requestRedraw();
             return true;
         }
 
@@ -1138,7 +1200,7 @@ export function createDepthEditor({
                 L.w = Math.max(8, Math.round(rect.w));
                 L.h = Math.max(8, Math.round(rect.h));
             }
-            onRedraw?.();
+            requestRedraw();
             return true;
         }
 
@@ -1147,7 +1209,7 @@ export function createDepthEditor({
             paintTo(p.x, p.y);
             dirty = true;
         }
-        onRedraw?.();
+        requestRedraw();
         return true;
     }
 
@@ -1165,7 +1227,7 @@ export function createDepthEditor({
             }
             cropOp = null;
             scheduleCommit(120);
-            onRedraw?.();
+            requestRedraw();
             return true;
         }
         if (layerOp) {
@@ -1180,7 +1242,7 @@ export function createDepthEditor({
             layerGuides = [];
             syncCursor();
             scheduleCommit(120);
-            onRedraw?.();
+            requestRedraw();
             return true;
         }
         if (!drawing) return false;
@@ -1193,7 +1255,7 @@ export function createDepthEditor({
     function pointerLeave() {
         hover = null;
         if (drawing || layerOp || cropOp) pointerUp();
-        onRedraw?.();
+        requestRedraw();
     }
 
     // ---------- 操作 ----------
@@ -1238,7 +1300,7 @@ export function createDepthEditor({
         syncCursor();
         dirty = true;
         scheduleCommit(80);
-        onRedraw?.();
+        requestRedraw();
     }
 
     function fillSelected() {
@@ -1263,7 +1325,7 @@ export function createDepthEditor({
         c.fill();
         dirty = true;
         scheduleCommit(80);
-        onRedraw?.();
+        requestRedraw();
     }
 
     async function importBlob(blob) {
@@ -1340,7 +1402,7 @@ export function createDepthEditor({
             pushAddLayer(layers.length - 1);
             scheduleCommit(80);
         }
-        onRedraw?.();
+        requestRedraw();
         if (colorful) toast?.show?.("这张图是彩色的，已按亮度转成灰度", 2200);
         return true;
     }
@@ -1359,7 +1421,7 @@ export function createDepthEditor({
             rctx.clearRect(0, 0, raster.width, raster.height);
             rctx.drawImage(img, 0, 0, raster.width, raster.height);
             dirty = true;
-            onRedraw?.();
+            requestRedraw();
             return true;
         } catch (_) {
             return false;
@@ -1493,7 +1555,7 @@ export function createDepthEditor({
     brushRange.addEventListener("input", () => {
         brush = Number(brushRange.value);
         brushNum.textContent = String(brush);
-        onRedraw?.();
+        requestRedraw();
     });
     makeNumEditable(brushNum, {
         min: 4,
@@ -1503,7 +1565,7 @@ export function createDepthEditor({
             brush = v;
             brushRange.value = String(v);
             brushNum.textContent = String(v);
-            onRedraw?.();
+            requestRedraw();
         },
     });
     brushWrap.append(brushText, brushRange, brushNum);
@@ -1595,7 +1657,7 @@ export function createDepthEditor({
         if (tool === "move" && activeLayer < 0 && layers.length) activeLayer = layers.length - 1;
         syncTools();
         syncCursor();
-        onRedraw?.();
+        requestRedraw();
     });
     el.appendChild(moveBtn);
 
@@ -1609,7 +1671,7 @@ export function createDepthEditor({
         tool = activeLayer >= 0 ? "move" : "brush";
         syncTools();
         syncCursor();
-        onRedraw?.();
+        requestRedraw();
     });
     el.appendChild(layerSelect);
 
@@ -1633,7 +1695,7 @@ export function createDepthEditor({
         rebuildLayerSelect();
         syncCursor();
         scheduleCommit(80);
-        onRedraw?.();
+        requestRedraw();
     });
     el.appendChild(delLayerBtn);
 
@@ -1655,7 +1717,7 @@ export function createDepthEditor({
             syncTools();
             syncCursor();
             scheduleCommit(80);
-            onRedraw?.();
+            requestRedraw();
             toast?.show?.("已恢复整层", 1400);
             return;
         }
@@ -1671,7 +1733,7 @@ export function createDepthEditor({
         }
         syncTools();
         syncCursor();
-        onRedraw?.();
+        requestRedraw();
     });
     el.appendChild(cropBtn);
 
@@ -1738,7 +1800,7 @@ export function createDepthEditor({
             if (drawing) pointerUp();
             flushCommit();
         }
-        onRedraw?.();
+        requestRedraw();
     }
 
     function toggle() {
