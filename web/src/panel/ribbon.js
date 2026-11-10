@@ -83,6 +83,7 @@ function bindTooltip(btn, text) {
 export function closePopover() {
     if (!activePopover) return;
     activePopover.anchor.classList.remove("is-active");
+    activePopover.el._mossCleanup?.();
     activePopover.el.remove();
     activePopover = null;
 }
@@ -124,14 +125,11 @@ export function openPopover(anchor, content, { width = 0 } = {}) {
         document.addEventListener("keydown", onKey, true);
     }, 0);
 
+    // 清理函数挂在弹层上，由 closePopover 显式调用。
+    // 不再覆盖 DOM 原生的 remove（Registry 扫描器曾把 pop.remove.bind(pop) 误报成网络操作）。
     pop._mossCleanup = () => {
         document.removeEventListener("mousedown", onDown, true);
         document.removeEventListener("keydown", onKey, true);
-    };
-    const origRemove = pop.remove.bind(pop);
-    pop.remove = () => {
-        pop._mossCleanup?.();
-        origRemove();
     };
 }
 
