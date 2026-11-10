@@ -51,6 +51,10 @@ export function createFloatingPanel(node, jsonWidget) {
     let bgStartMouse = { x: 0, y: 0 };
     let bgInitialState = null;
     let bgSource = "none"; // 'manual' | 'auto'
+    // 背景图层属性（右侧栏那一行用）
+    let bgName = "背景图";
+    let bgVisible = true;
+    let bgLocked = false;
 
     // 背景图裁剪：比例坐标（相对背景图），只影响显示，不动原图
     let bgCrop = null;
@@ -88,6 +92,11 @@ export function createFloatingPanel(node, jsonWidget) {
         bgCropMode = false;
         bgCropOp = null;
         // 不退出背景图模式：清掉后还能直接在工具条里再导入一张
+        bgLocked = false;
+        bgVisible = true;
+        bgName = "背景图";
+        renderBgList();
+        updateTabLabels();
         syncBgMode?.();
         if (syncBgSizeHook) syncBgSizeHook();
         if (bgUploadInput) bgUploadInput.value = ""; 
@@ -110,6 +119,9 @@ export function createFloatingPanel(node, jsonWidget) {
             bgActive = true;
             leaveDepthMode();
         }
+        bgVisible = true;
+        renderBgList();
+        updateTabLabels();
         syncBgMode?.();
         if (syncBgSizeHook) syncBgSizeHook();
         safeRedraw();
@@ -774,6 +786,14 @@ export function createFloatingPanel(node, jsonWidget) {
 .moss-editor .moss-frame-color::-webkit-color-swatch-wrapper { padding: 0; }
 .moss-editor .moss-frame-color::-webkit-color-swatch { border: none; border-radius: 3px; }
 .moss-editor .moss-frame-color::-moz-color-swatch { border: none; border-radius: 3px; }
+.moss-side-tab {
+    flex: 1 1 0; height: 26px; padding: 0 4px; cursor: pointer;
+    background: transparent; color: #8f959d; border: none;
+    border-bottom: 2px solid transparent; font-size: 11px;
+}
+.moss-side-tab:hover { color: #ddd; background: #24252a; }
+.moss-side-tab.is-on { color: #fff; border-bottom-color: var(--moss-accent, #4dabf7); background: #24252a; }
+
 .moss-editor .moss-swatch { width: 24px; height: 24px; box-sizing: border-box; border-radius: 4px; border: 2px solid #555; cursor: pointer; transition: border-color 0.12s, transform 0.12s, box-shadow 0.12s; }
 .moss-editor .moss-swatch:hover { border-color: #8a8a8a; transform: translateY(-1px); }
 .moss-editor .moss-swatch.is-selected { border-color: #4a9eff; box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.35); }
@@ -2012,6 +2032,146 @@ export function createFloatingPanel(node, jsonWidget) {
     listArea.style.cssText =
         "display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; overflow-x: hidden; flex: 1; min-width: 0;";
 
+    // ================= 右栏：三层列表（框 / 背景 / 深度） =================
+    // 三个页签共用一套行样式（.moss-layer-row），数据仍各归各的：
+    // 框在 model.items，背景在 bgImage，深度在 depthEditor.layers。
+    const layerPanel = document.createElement("div");
+    layerPanel.style.cssText =
+        "display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; margin: 10px 10px 10px;" +
+        "border: 1px solid #35373c; border-radius: 6px; overflow: hidden; background: #1b1c1f;";
+
+    const layerTabs = document.createElement("div");
+    layerTabs.style.cssText = "display: flex; flex: 0 0 auto; border-bottom: 1px solid #35373c;";
+
+    const layerPanes = document.createElement("div");
+    layerPanes.style.cssText = "position: relative; flex: 1 1 auto; min-height: 0; display: flex;";
+
+    const makePane = () => {
+        const p = document.createElement("div");
+        p.style.cssText = "display: none; flex: 1 1 auto; min-height: 0; flex-direction: column;";
+        layerPanes.appendChild(p);
+        return p;
+    };
+    const paneBox = makePane();
+    const paneBg = makePane();
+    const paneDepth = makePane();
+
+    const tabBtns = {};
+    const mkTab = (key) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "moss-side-tab";
+        b.dataset.key = key;
+        b.addEventListener("click", () => setRightTab(key));
+        layerTabs.appendChild(b);
+        tabBtns[key] = b;
+    };
+    mkTab("box");
+    mkTab("bg");
+    mkTab("depth");
+
+    let rightTab = "box";
+    function setRightTab(key) {
+        rightTab = key;
+        [["box", paneBox], ["bg", paneBg], ["depth", paneDepth]].forEach(([k, p]) => {
+            p.style.display = k === key ? "flex" : "none";
+            tabBtns[k].classList.toggle("is-on", k === key);
+        });
+    }
+    function updateTabLabels() {
+        tabBtns.box.textContent = `框 ${model.items.length}`;
+        tabBtns.bg.textContent = `背景 ${bgImage ? 1 : 0}`;
+        tabBtns.depth.textContent = `深度 ${depthEditor ? depthEditor.layerCount() : 0}`;
+    }
+
+    // ---- 背景页：现在只有一张，结构按「图层」写，后面接多图层不用重做 ----
+    const bgListArea = document.createElement("div");
+    bgListArea.className = "moss-layer-list";
+    paneBg.appendChild(bgListArea);
+
+    function bgInlineRename(span) {
+        const input = document.createElement("input");
+        input.className = "moss-layer-rename";
+        input.value = bgName;
+        span.textContent = "";
+        span.appendChild(input);
+        input.focus();
+        try { input.select(); } catch (_) { /* 忽略 */ }
+        const finish = (ok) => {
+            if (ok) {
+                const v = input.value.trim();
+                if (v) bgName = v;
+            }
+            renderBgList();
+        };
+        input.addEventListener("keydown", (e) => {
+            e.stopPropagation();
+            if (e.key === "Enter") finish(true);
+            else if (e.key === "Escape") finish(false);
+        });
+        input.addEventListener("blur", () => finish(true));
+        input.addEventListener("mousedown", (e) => e.stopPropagation());
+        input.addEventListener("click", (e) => e.stopPropagation());
+    }
+
+    function renderBgList() {
+        bgListArea.textContent = "";
+        if (!bgImage) {
+            const empty = document.createElement("div");
+            empty.className = "moss-layer-empty";
+            empty.textContent = "还没有背景图 · 工具条「导入」或 Ctrl+V 加一张";
+            bgListArea.appendChild(empty);
+            return;
+        }
+        const row = document.createElement("div");
+        row.className = "moss-layer-row is-active";
+        if (!bgVisible) row.classList.add("is-hidden");
+        row.title = "点击进入背景图模式";
+
+        const name = document.createElement("span");
+        name.className = "moss-layer-name";
+        name.textContent = bgName;
+        name.title = "双击改名";
+        name.addEventListener("dblclick", (e) => {
+            e.stopPropagation();
+            bgInlineRename(name);
+        });
+        name.addEventListener("mousedown", (e) => e.stopPropagation());
+        name.addEventListener("click", (e) => e.stopPropagation());
+
+        const lock = document.createElement("span");
+        lock.className = "moss-layer-flag";
+        lock.textContent = "锁";
+        lock.style.color = bgLocked ? "#ffa94d" : "#5d6167";
+        lock.title = bgLocked ? "已锁定，点击解锁" : "锁定：画布上不能拖动/拉伸";
+        lock.addEventListener("mousedown", (e) => e.stopPropagation());
+        lock.addEventListener("click", (e) => {
+            e.stopPropagation();
+            bgLocked = !bgLocked;
+            renderBgList();
+            safeRedraw();
+        });
+
+        const eye = document.createElement("span");
+        eye.className = "moss-layer-eye";
+        eye.textContent = bgVisible ? "●" : "○";
+        eye.title = bgVisible ? "点一下隐藏" : "已隐藏，点一下显示";
+        eye.addEventListener("mousedown", (e) => e.stopPropagation());
+        eye.addEventListener("click", (e) => {
+            e.stopPropagation();
+            bgVisible = !bgVisible;
+            renderBgList();
+            safeRedraw();
+        });
+
+        row.append(name, lock, eye);
+        row.addEventListener("click", () => {
+            if (bgLocked) return;
+            setBgMode(true);
+        });
+        bgListArea.appendChild(row);
+    }
+
     // ================= 顶部工具条：画布 / 背景 / 视图 =================
     const canvasPop = document.createElement("div");
     canvasPop.style.cssText = "display: flex; flex-direction: column; gap: 10px;";
@@ -2209,7 +2369,24 @@ export function createFloatingPanel(node, jsonWidget) {
     rightContainer.appendChild(resolutionCard.el);
     rightContainer.appendChild(promptCard.el);
     rightContainer.appendChild(charCard.el);
-    rightContainer.appendChild(listArea);
+
+    paneBox.appendChild(listArea);
+    layerPanel.appendChild(layerTabs);
+    layerPanel.appendChild(layerPanes);
+    rightContainer.appendChild(layerPanel);
+    // 在「深度」页里点东西就顺手进深度模式，否则列表能点但画布不响应
+    paneDepth.addEventListener("mousedown", () => {
+        if (!depthEditor || depthEditor.isActive()) return;
+        if (bgActive) setBgMode(false);
+        depthEditor.setActive(true);
+        syncDepthBtn();
+        updateUndoButtonsRef?.();
+        drawCanvas();
+    });
+
+    setRightTab("box");
+    updateTabLabels();
+    renderBgList();
 
     contentContainer.appendChild(rightContainer);
     panel.appendChild(contentContainer);
@@ -2849,6 +3026,8 @@ export function createFloatingPanel(node, jsonWidget) {
         },
         onRedraw: () => drawCanvas(),
         onHistoryChange: () => updateUndoButtonsRef?.(),
+        layersHost: paneDepth,
+        onLayersChanged: () => updateTabLabels(),
         // 图层吸附跟随顶部的「无 / 对象 / 网格」设置
         getSnapMode: () => snapMode,
         getGridSize: () => GRID_SNAP,
@@ -3292,7 +3471,7 @@ export function createFloatingPanel(node, jsonWidget) {
         ctx.fillRect(p1.x, p1.y, canvasW_phys, canvasH_phys);
 
         // 🌟 渲染背景图（不裁剪到逻辑画布内：否则超出部分和四角控制点会被剪掉，没法拉伸）
-        if (bgImage) {
+        if (bgImage && bgVisible) {
             ctx.save();
             ctx.globalAlpha = bgOpacity;
             const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
@@ -3732,7 +3911,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // 背景图命中检测（操控模式）：返回 "tl"/"tr"/"bl"/"br"/"t"/"b"/"l"/"r"/"move"/null
     const getBgHitMode = (mouseX, mouseY) => {
-        if (!bgActive || !bgImage) return null;
+        if (!bgActive || !bgImage || bgLocked || !bgVisible) return null;
         const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
         const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
         // 拉伸点可能在画布外的黑色区域，容差放宽一点
@@ -5769,6 +5948,8 @@ export function createFloatingPanel(node, jsonWidget) {
     };
 
     const renderList = (resetActive = true) => {
+        // 角标跟着列表数量走，放在最前面，后面提前 return 也能更新
+        updateTabLabels();
         syncCanvasMode();
         syncPrompt();
 
