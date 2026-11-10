@@ -346,6 +346,17 @@ ComfyUI/custom_nodes/MOSS_BBox_Enhancer
 
 重启 ComfyUI 后即可使用。
 
+### 示例工作流
+
+仓库里的 `example_workflows/` 放了两份可直接拖进 ComfyUI 的工作流：
+
+| 文件 | 内容 |
+|---|---|
+| `Moss_BBox控制 示例.json` | 基础用法：布局编辑器 → 创建边界框 → 采样 |
+| `Moss_BBox控制+深度图控制.json` | 在上面基础上接了深度图：MoGe 估深度 + 面板手绘的深度图层一起进采样 |
+
+两份都用了新版 ComfyUI 的**子图**（subgraph），前端版本较旧的话打不开；里面的 `MarkdownNote` 写了用到的模型下载地址，按需从 `UNETLoader` 换成自己有的模型即可。
+
 ## 说明
 
 前端可以直接读取上游节点中的静态 JSON 文本控件。对于 Python 节点运行后才生成的动态输出，必须先执行工作流，上游结果生成后尺寸映射器才能读取并推测尺寸。
