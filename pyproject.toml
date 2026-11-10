@@ -1,7 +1,7 @@
 [project]
 name = "moss-bbox-enhancer"
 description = "MOSS 布局 JSON 导入与可视化边界框编辑：面板手绘深度图/深度图层、背景图裁剪、DWPose 人体部位识别、尺寸映射与按框色绘制。"
-version = "1.7.3"
+version = "1.7.4"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
 # ComfyUI 本身自带 numpy / Pillow，这里只是把依赖写明确，Manager 会跳过已装的

@@ -70,13 +70,28 @@ function ensureStyle() {
     border-radius: 4px; font: inherit; font-size: 11px; text-align: right;
     font-variant-numeric: tabular-nums; outline: none;
 }
-.moss-depth-select {
-    height: 22px; max-width: 96px; padding: 0 2px; flex: 0 0 auto;
-    background: #2f3136; color: #ddd; border: 1px solid #45484e;
-    border-radius: 5px; font-size: 11px; outline: none; cursor: pointer;
+.moss-layer-pop {
+    position: fixed; z-index: 60; display: none; flex-direction: column;
+    min-width: 168px; max-height: 224px; overflow-y: auto; padding: 4px;
+    background: #26272b; border: 1px solid #45484e; border-radius: 6px;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, .45); box-sizing: border-box;
 }
-.moss-depth-select:disabled { opacity: .4; cursor: default; }
-.moss-depth-select:hover { border-color: #666; color: #fff; }
+.moss-layer-row {
+    display: flex; align-items: center; gap: 5px; height: 24px; padding: 0 4px;
+    border-radius: 4px; font-size: 11px; color: #cfd3d8; cursor: pointer;
+    user-select: none; -webkit-user-select: none;
+}
+.moss-layer-row:hover { background: #33353a; }
+.moss-layer-row.is-active { background: #1f4f7a; color: #fff; }
+.moss-layer-row.is-drag { opacity: .45; }
+.moss-layer-handle { color: #6b7076; cursor: grab; letter-spacing: -2px; }
+.moss-layer-name {
+    flex: 1 1 auto; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.moss-layer-eye { flex: 0 0 auto; width: 14px; text-align: center; color: #9aa0a6; }
+.moss-layer-empty { padding: 6px 4px; font-size: 11px; color: #6b7076; }
+.moss-layer-row.is-base { color: #9aa0a6; margin-top: 2px; border-top: 1px solid #35373c; border-radius: 0 0 4px 4px; padding-top: 2px; height: 26px; }
 .moss-depth-range { width: 86px; accent-color: var(--moss-accent, #4dabf7); }
 .moss-depth-range.is-gray { width: 76px; }
 .moss-depth-tip { color: #7d838c; }
@@ -85,7 +100,9 @@ function ensureStyle() {
 }
 
 function rgb(v) {
-    return `rgb(${v},${v},${v})`;
+    // 灰度偏移会把值推到 0~255 之外，先夹住，否则拼出来的是非法颜色
+    const n = Math.max(0, Math.min(255, Math.round(v)));
+    return `rgb(${n},${n},${n})`;
 }
 
 function loadImage(url) {
@@ -174,6 +191,45 @@ export function createDepthEditor({
         if (snapshot) rctx.drawImage(snapshot, 0, 0, raster.width, raster.height);
     }
 
+    // ---------- 每层灰度偏移 ----------
+    // 原图始终是 L.canvas，一个像素都不改；偏移结果缓存在 L.adj，
+    // 绘制 / 合成 / 导出都读缓存。所以「变近变远」是显示层的效果，撤销一次就回原样。
+    function buildAdjusted(L) {
+        const cv = L.adj || (L.adj = document.createElement("canvas"));
+        if (cv.width !== L.canvas.width || cv.height !== L.canvas.height) {
+            cv.width = L.canvas.width;
+            cv.height = L.canvas.height;
+        }
+        const c = cv.getContext("2d", { willReadFrequently: true });
+        c.clearRect(0, 0, cv.width, cv.height);
+        c.drawImage(L.canvas, 0, 0);
+
+        const off = Math.round(L.offset || 0);
+        if (off) {
+            const img = c.getImageData(0, 0, cv.width, cv.height);
+            const d = img.data;
+            // 256 项查表，比逐像素 min/max 快一半以上
+            const lut = new Uint8ClampedArray(256);
+            for (let i = 0; i < 256; i += 1) lut[i] = i + off;
+            for (let i = 0; i < d.length; i += 4) {
+                d[i] = lut[d[i]];
+                d[i + 1] = lut[d[i + 1]];
+                d[i + 2] = lut[d[i + 2]];
+            }
+            c.putImageData(img, 0, 0);
+        }
+        L.adjCtx = c;
+        L.adjFor = off;
+        return cv;
+    }
+
+    // 画这一层时该用哪张：没偏移就是原图，有偏移用缓存（过期就重建）
+    function bitmapOf(L) {
+        if (!L.offset) return L.canvas;
+        if (L.adj && L.adjFor === Math.round(L.offset)) return L.adj;
+        return buildAdjusted(L);
+    }
+
     const composeCanvas = document.createElement("canvas");
 
     // 撤销快照用 canvas 拷贝，不再 toDataURL：
@@ -226,10 +282,10 @@ export function createDepthEditor({
                     Math.max(1, cr.h),
                 );
                 cctx.clip();
-                cctx.drawImage(L.canvas, L.x, L.y, L.w, L.h);
+                cctx.drawImage(bitmapOf(L), L.x, L.y, L.w, L.h);
                 cctx.restore();
             } else {
-                cctx.drawImage(L.canvas, L.x, L.y, L.w, L.h);
+                cctx.drawImage(bitmapOf(L), L.x, L.y, L.w, L.h);
             }
         }
         return target;
@@ -247,6 +303,8 @@ export function createDepthEditor({
     //   stroke    { target: "base" | index, before: dataURL }
     //   transform { index, before: {x,y,w,h} }        —— 十几字节
     //   crop      { index, before: crop|null }        —— 几十字节
+    //   offset    { index, before }                   图层整体灰度偏移
+    //   order     { before: [...layers], active }      图层前后顺序
     //   add       { index, layer }                    撤销=移除，重做=插回
     //   remove    { index, layer }                    撤销=插回，重做=移除
     //   clear     { base, layers }                    整体恢复
@@ -268,6 +326,7 @@ export function createDepthEditor({
             h: L.h,
             visible: true,
             crop: L.crop ? { ...L.crop } : null,
+            offset: L.offset || 0,
             name: L.name,
         };
     }
@@ -331,6 +390,11 @@ export function createDepthEditor({
         return entry;
     }
 
+    // 拖动排序前拍一张顺序快照（只存对象引用，几乎不占内存）
+    function pushOrder() {
+        return pushEntry({ type: "order", before: layers.slice(), active: activeLayer });
+    }
+
     function pushAddLayer(index) {
         if (!layers[index]) return null;
         // 不存位图：撤销时把被移除的这层 clone 进 redo 就够了
@@ -373,6 +437,12 @@ export function createDepthEditor({
                 if (!L) return null;
                 return { ...entry, before: L.crop ? { ...L.crop } : null };
             }
+            case "offset": {
+                const L = layers[entry.index];
+                return L ? { ...entry, before: Math.round(L.offset || 0) } : null;
+            }
+            case "order":
+                return { ...entry, before: layers.slice(), active: activeLayer };
             case "add": {
                 const L = layers[entry.index];
                 return L ? { ...entry, layer: cloneLayer(L) } : null;
@@ -394,7 +464,7 @@ export function createDepthEditor({
     function afterRestore() {
         dirty = true;
         syncTools();
-        rebuildLayerSelect();
+        refreshLayerUI();
         scheduleCommit();
         requestRedraw();
     }
@@ -408,7 +478,11 @@ export function createDepthEditor({
                     const L = layers[entry.target];
                     if (!L) return;
                     drawSnapshot(L.ctx, entry.before, L.canvas.width, L.canvas.height)
-                        .then(afterRestore);
+                        .then(() => {
+                            L.adj = null; // 位图变了，偏移缓存作废，下次绘制时重建
+                            L.adjCtx = null;
+                            afterRestore();
+                        });
                 }
                 return;
             }
@@ -426,6 +500,23 @@ export function createDepthEditor({
                 const L = layers[entry.index];
                 if (!L) return;
                 L.crop = entry.before ? { ...entry.before } : null;
+                afterRestore();
+                return;
+            }
+            case "offset": {
+                const L = layers[entry.index];
+                if (!L) return;
+                L.offset = Math.round(entry.before || 0);
+                if (L.offset) buildAdjusted(L);
+                else { L.adj = null; L.adjCtx = null; }
+                afterRestore();
+                return;
+            }
+            case "order": {
+                layers = entry.before.slice();
+                activeLayer = entry.active;
+                cropMode = false;
+                cropOp = null;
                 afterRestore();
                 return;
             }
@@ -514,6 +605,7 @@ export function createDepthEditor({
                     h: L.h,
                     name: L.name,
                     key: L.key || "",
+                    offset: Math.round(L.offset || 0),
                     crop: L.crop
                         ? { x: L.crop.x, y: L.crop.y, w: L.crop.w, h: L.crop.h }
                         : null,
@@ -589,6 +681,7 @@ export function createDepthEditor({
                     w: cw,
                     h: ch,
                     visible: true,
+                    offset: Math.round(Number(d.offset) || 0),
                     crop: d.crop
                         ? (() => {
                             let cx = Number(d.crop.x) || 0;
@@ -627,7 +720,7 @@ export function createDepthEditor({
 
         activeLayer = layers.length ? layers.length - 1 : -1;
         tool = layers.length ? "move" : "brush";
-        rebuildLayerSelect();
+        refreshLayerUI();
         syncTools();
         syncCursor();
         dirty = !!state.base || layers.length > 0;
@@ -637,15 +730,8 @@ export function createDepthEditor({
 
     // ---------- 绘制 ----------
 
-    function paintTo(px, py) {
-        const color = rgb(value);
-        // 选中图层时直接画在这一层上；选「笔刷层」（activeLayer = -1）时画在底层
-        const target = activeLayer >= 0 ? layers[activeLayer] : null;
-        const c = target ? target.ctx : rctx;
-        const ox = target ? target.x : 0;
-        const oy = target ? target.y : 0;
-        const x = px - ox;
-        const y = py - oy;
+    // 在某个 context 上画一段（坐标已经是图层局部坐标）
+    function drawSegment(c, color, x, y) {
         c.strokeStyle = color;
         c.fillStyle = color;
         c.lineWidth = brush;
@@ -660,6 +746,26 @@ export function createDepthEditor({
             c.beginPath();
             c.arc(x, y, Math.max(0.5, brush / 2), 0, Math.PI * 2);
             c.fill();
+        }
+    }
+
+    function paintTo(px, py) {
+        // 选中图层时直接画在这一层上；选「笔刷层」（activeLayer = -1）时画在底层
+        const target = activeLayer >= 0 ? layers[activeLayer] : null;
+        const c = target ? target.ctx : rctx;
+        const ox = target ? target.x : 0;
+        const oy = target ? target.y : 0;
+        const x = px - ox;
+        const y = py - oy;
+        const off = target ? Math.round(target.offset || 0) : 0;
+
+        drawSegment(c, rgb(value), x, y);
+
+        // 这一层有灰度偏移时，缓存层里同步画一份「值 + 偏移」的笔迹。
+        // 否则刚画的笔要等下次重建缓存才看得见，拖起来会像卡住。
+        if (off && target) {
+            if (!target.adjCtx || target.adjFor !== off) buildAdjusted(target);
+            drawSegment(target.adjCtx, rgb(value + off), x, y);
         }
         last = { x, y };
     }
@@ -698,10 +804,10 @@ export function createDepthEditor({
                         Math.max(1, cr.h * sy),
                     );
                     ctx.clip();
-                    ctx.drawImage(L.canvas, p1.x + L.x * sx, p1.y + L.y * sy, L.w * sx, L.h * sy);
+                    ctx.drawImage(bitmapOf(L), p1.x + L.x * sx, p1.y + L.y * sy, L.w * sx, L.h * sy);
                     ctx.restore();
                 } else {
-                    ctx.drawImage(L.canvas, p1.x + L.x * sx, p1.y + L.y * sy, L.w * sx, L.h * sy);
+                    ctx.drawImage(bitmapOf(L), p1.x + L.x * sx, p1.y + L.y * sy, L.w * sx, L.h * sy);
                 }
             }
         }
@@ -1296,7 +1402,7 @@ export function createDepthEditor({
         // 清空等于把面板复位：外部深度图的去重记录也清掉，重新执行才能再注入一次
         injectedKeys.clear();
         syncTools();
-        rebuildLayerSelect();
+        refreshLayerUI();
         syncCursor();
         dirty = true;
         scheduleCommit(80);
@@ -1318,11 +1424,21 @@ export function createDepthEditor({
         const oy = L ? L.y : 0;
         const cx = rect.x + rect.w / 2 + w / 2 - ox;
         const cy = rect.y + rect.h / 2 + h / 2 - oy;
+        const rx = Math.max(1, Math.abs(rect.w) / 2);
+        const ry = Math.max(1, Math.abs(rect.h) / 2);
         c.fillStyle = rgb(value);
         c.beginPath();
-        c.ellipse(cx, cy, Math.max(1, Math.abs(rect.w) / 2),
-                  Math.max(1, Math.abs(rect.h) / 2), 0, 0, Math.PI * 2);
+        c.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
         c.fill();
+
+        const off = L ? Math.round(L.offset || 0) : 0;
+        if (off && L) {
+            if (!L.adjCtx || L.adjFor !== off) buildAdjusted(L);
+            L.adjCtx.fillStyle = rgb(value + off);
+            L.adjCtx.beginPath();
+            L.adjCtx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+            L.adjCtx.fill();
+        }
         dirty = true;
         scheduleCommit(80);
         requestRedraw();
@@ -1386,6 +1502,7 @@ export function createDepthEditor({
             w: lw,
             h: lh,
             visible: true,
+            offset: 0,
             crop: null,
             name: `图层 ${layers.length + 1}`,
         });
@@ -1393,7 +1510,7 @@ export function createDepthEditor({
         tool = "move"; // 导入后直接能拖，省一步
         if (!active) setActive(true); // 不在深度模式时 draw() 会直接 return，图层会「看不见」
         syncTools();
-        rebuildLayerSelect();
+        refreshLayerUI();
         syncCursor();
         dirty = true;
         // 外部注入不写回控件：这时 depth_png 仍是空的，后端就会用节点接的 depth_image，
@@ -1417,7 +1534,7 @@ export function createDepthEditor({
             layers = [];
             activeLayer = -1;
             syncTools();
-            rebuildLayerSelect();
+            refreshLayerUI();
             rctx.clearRect(0, 0, raster.width, raster.height);
             rctx.drawImage(img, 0, 0, raster.width, raster.height);
             dirty = true;
@@ -1661,19 +1778,23 @@ export function createDepthEditor({
     });
     el.appendChild(moveBtn);
 
-    const layerSelect = document.createElement("select");
-    layerSelect.className = "moss-depth-select";
-    layerSelect.title = "选择要拖动 / 删除的图层；顶层在最上面";
-    layerSelect.addEventListener("change", () => {
-        activeLayer = Number(layerSelect.value);
-        cropMode = false;
-        cropOp = null;
-        tool = activeLayer >= 0 ? "move" : "brush";
-        syncTools();
-        syncCursor();
-        requestRedraw();
+    // 图层按钮：点开弹层，列表按「上面的盖住下面的」排，拖行就能改遮挡顺序
+    const layerBtn = document.createElement("button");
+    layerBtn.type = "button";
+    layerBtn.className = "moss-mode-btn";
+    layerBtn.textContent = "图层";
+    layerBtn.title = "图层列表：拖动行改前后顺序（上面的盖住下面的），点眼睛显示/隐藏";
+    layerBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        toggleLayerPop();
     });
-    el.appendChild(layerSelect);
+    el.appendChild(layerBtn);
+
+    const layerPop = document.createElement("div");
+    layerPop.className = "moss-layer-pop";
+    const layerList = document.createElement("div");
+    layerPop.appendChild(layerList);
+    el.appendChild(layerPop);
 
     const delLayerBtn = document.createElement("button");
     delLayerBtn.type = "button";
@@ -1692,7 +1813,7 @@ export function createDepthEditor({
         cropOp = null;
         if (!layers.length) tool = "brush";
         syncTools();
-        rebuildLayerSelect();
+        refreshLayerUI();
         syncCursor();
         scheduleCommit(80);
         requestRedraw();
@@ -1737,21 +1858,278 @@ export function createDepthEditor({
     });
     el.appendChild(cropBtn);
 
-    function rebuildLayerSelect() {
-        const keep = activeLayer;
-        layerSelect.textContent = "";
-        const mk = (v, t) => {
-            const o = document.createElement("option");
-            o.value = String(v);
-            o.textContent = t;
-            layerSelect.appendChild(o);
-        };
-        mk(-1, layers.length ? "笔刷层" : "无图层");
-        layers.forEach((L, i) => mk(i, L.name));
-        activeLayer = keep >= 0 && keep < layers.length ? keep : -1;
-        layerSelect.value = String(activeLayer);
-        layerSelect.disabled = layers.length === 0;
+    // 图层整体灰度：只作用于当前选中的图层，负值更黑（更远）、正值更白（更近）
+    const layerGrayWrap = document.createElement("div");
+    layerGrayWrap.style.cssText = "display:flex;align-items:center;gap:5px;flex:0 0 auto;";
+    const grayOffLabel = document.createElement("span");
+    grayOffLabel.className = "moss-mode-label";
+    grayOffLabel.textContent = "层灰度";
+    grayOffLabel.title = "整体加深 / 变浅当前图层：负值更黑（更远），正值更白（更近）";
+    const offRange = document.createElement("input");
+    offRange.type = "range";
+    offRange.min = "-128";
+    offRange.max = "128";
+    offRange.step = "1";
+    offRange.value = "0";
+    const offNum = document.createElement("span");
+    offNum.className = "moss-depth-num";
+    offNum.textContent = "0";
+    layerGrayWrap.append(grayOffLabel, offRange, offNum);
+    el.appendChild(layerGrayWrap);
+
+    let offsetStart = 0;
+
+    function syncGray() {
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        const v = L ? Math.round(L.offset || 0) : 0;
+        offRange.value = String(v);
+        if (offNum.dataset.editing !== "1") offNum.textContent = String(v);
+        offRange.disabled = !L;
+        layerGrayWrap.style.opacity = L ? "1" : "0.45";
+    }
+
+    function applyOffset(v) {
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        if (!L) return;
+        L.offset = Math.max(-128, Math.min(128, Math.round(v)));
+        if (L.offset) {
+            buildAdjusted(L); // 立刻重建缓存，滑块拖到哪看到哪
+        } else {
+            L.adj = null;
+            L.adjCtx = null;
+        }
+        requestRedraw();
+        scheduleCommit(200);
+    }
+
+    offRange.addEventListener("pointerdown", () => {
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        offsetStart = L ? Math.round(L.offset || 0) : 0;
+    });
+    offRange.addEventListener("input", () => {
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        if (!L) { offRange.value = "0"; return; }
+        offNum.textContent = offRange.value;
+        applyOffset(Number(offRange.value));
+    });
+    // 松手才入撤销栈：一次拖动 = 一条记录，dragging 过程中不会刷爆栈
+    offRange.addEventListener("pointerup", () => {
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        if (!L) return;
+        const now = Math.round(L.offset || 0);
+        if (now !== offsetStart) {
+            pushEntry({ type: "offset", index: activeLayer, before: offsetStart });
+        }
+        offsetStart = now;
+    });
+
+    makeNumEditable(offNum, {
+        min: -128,
+        max: 128,
+        get: () => {
+            const L = activeLayer >= 0 ? layers[activeLayer] : null;
+            return L ? Math.round(L.offset || 0) : 0;
+        },
+        commit: (v) => {
+            const L = activeLayer >= 0 ? layers[activeLayer] : null;
+            if (!L) return;
+            const before = Math.round(L.offset || 0);
+            applyOffset(v);
+            if (Math.round(L.offset) !== before) {
+                pushEntry({ type: "offset", index: activeLayer, before });
+            }
+        },
+    });
+
+    // ---------- 图层列表（拖动排序） ----------
+
+    // 显示顺序和绘制顺序相反：数组末尾是「上层」，列表里排第一
+    function displayLayers() {
+        return layers.slice().reverse();
+    }
+
+    let layerDrag = null;
+
+    function renderLayerList() {
+        layerList.textContent = "";
+        const disp = displayLayers();
+        if (!disp.length) {
+            const empty = document.createElement("div");
+            empty.className = "moss-layer-empty";
+            empty.textContent = "还没有图层";
+            layerList.appendChild(empty);
+            return;
+        }
+        disp.forEach((L) => {
+            const row = document.createElement("div");
+            row.className = "moss-layer-row";
+            if (layers.indexOf(L) === activeLayer) row.classList.add("is-active");
+            if (layerDrag && layerDrag.layer === L) row.classList.add("is-drag");
+
+            const handle = document.createElement("span");
+            handle.className = "moss-layer-handle";
+            handle.textContent = "≡";
+            handle.title = "按住行拖动改顺序";
+
+            const name = document.createElement("span");
+            name.className = "moss-layer-name";
+            const off = Math.round(L.offset || 0);
+            name.textContent = off ? `${L.name} (${off > 0 ? "+" : ""}${off})` : L.name;
+
+            const eye = document.createElement("span");
+            eye.className = "moss-layer-eye";
+            eye.textContent = L.visible === false ? "○" : "●";
+            eye.title = L.visible === false ? "已隐藏，点一下显示" : "点一下隐藏";
+            eye.addEventListener("mousedown", (e) => e.stopPropagation());
+            eye.addEventListener("click", (e) => {
+                e.stopPropagation();
+                L.visible = L.visible === false;
+                renderLayerList();
+                scheduleCommit(80);
+                requestRedraw();
+            });
+
+            row.append(handle, name, eye);
+            row.addEventListener("mousedown", (e) => beginLayerDrag(e, L));
+            layerList.appendChild(row);
+        });
+
+        // 最底下是笔刷层（activeLayer = -1），不参与排序
+        const base = document.createElement("div");
+        base.className = "moss-layer-row is-base";
+        if (activeLayer < 0) base.classList.add("is-active");
+        const baseName = document.createElement("span");
+        baseName.className = "moss-layer-name";
+        baseName.textContent = "笔刷层（最底层）";
+        base.appendChild(baseName);
+        base.addEventListener("mousedown", (e) => e.stopPropagation());
+        base.addEventListener("click", (e) => {
+            e.stopPropagation();
+            activeLayer = -1;
+            cropMode = false;
+            cropOp = null;
+            tool = "brush";
+            syncTools();
+            syncCursor();
+            refreshLayerUI();
+            requestRedraw();
+            closeLayerPop();
+        });
+        layerList.appendChild(base);
+    }
+
+    function beginLayerDrag(e, L) {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        layerDrag = { layer: L, startY: e.clientY, moved: false };
+        window.addEventListener("mousemove", onLayerDragMove);
+        window.addEventListener("mouseup", endLayerDrag);
+    }
+
+    function onLayerDragMove(e) {
+        if (!layerDrag) return;
+        // 先给 4px 死区，避免「想点选」被当成拖动
+        if (!layerDrag.moved) {
+            if (Math.abs(e.clientY - layerDrag.startY) < 4) return;
+            layerDrag.moved = true;
+            pushOrder(); // 顺序快照要在第一次移动之前入栈
+        }
+        const rows = layerList.querySelectorAll(".moss-layer-row:not(.is-base)");
+        const n = rows.length;
+        if (!n) return;
+        // 越过某一行的中线就算挪到那一格；拖到底部（笔刷层那行）就是最底层
+        let to = n - 1;
+        for (let i = 0; i < n; i += 1) {
+            const r = rows[i].getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) { to = i; break; }
+        }
+        const li = layers.indexOf(layerDrag.layer);
+        if (li < 0) return;
+        const cur = layers.length - 1 - li;
+        if (to !== cur) moveLayerToDisplay(layerDrag.layer, to);
+    }
+
+    function endLayerDrag() {
+        window.removeEventListener("mousemove", onLayerDragMove);
+        window.removeEventListener("mouseup", endLayerDrag);
+        if (!layerDrag) return;
+        const d = layerDrag;
+        layerDrag = null;
+        if (!d.moved) {
+            selectLayer(d.layer);
+            return;
+        }
+        renderLayerList();
+        syncTools();
+        scheduleCommit(120);
+        requestRedraw();
+    }
+
+    function moveLayerToDisplay(layer, toDisp) {
+        const li = layers.indexOf(layer);
+        if (li < 0) return;
+        const fromDisp = layers.length - 1 - li;
+        if (fromDisp === toDisp) return;
+        const sel = activeLayer >= 0 ? layers[activeLayer] : null;
+        const disp = displayLayers();
+        disp.splice(fromDisp, 1);
+        disp.splice(toDisp, 0, layer);
+        layers = disp.reverse();
+        activeLayer = sel ? layers.indexOf(sel) : -1;
+        renderLayerList();
+        requestRedraw();
+    }
+
+    function selectLayer(layer) {
+        activeLayer = layers.indexOf(layer);
+        cropMode = false;
+        cropOp = null;
+        tool = activeLayer >= 0 ? "move" : "brush";
+        syncTools();
+        syncCursor();
+        refreshLayerUI();
+        requestRedraw();
+        closeLayerPop();
+    }
+
+    function openLayerPop() {
+        renderLayerList();
+        const r = layerBtn.getBoundingClientRect();
+        layerPop.style.left = `${Math.round(r.left)}px`;
+        layerPop.style.top = `${Math.round(r.bottom + 4)}px`;
+        layerPop.style.display = "flex";
+        layerBtn.classList.add("is-on");
+    }
+
+    function closeLayerPop() {
+        layerPop.style.display = "none";
+        layerBtn.classList.remove("is-on");
+    }
+
+    function toggleLayerPop() {
+        if (layerPop.style.display === "flex") closeLayerPop();
+        else openLayerPop();
+    }
+
+    // 点面板其它地方关掉弹层；顺便处理「面板已销毁但监听还在」的情况
+    document.addEventListener("mousedown", (e) => {
+        if (layerPop.style.display !== "flex") return;
+        if (!layerPop.isConnected) { closeLayerPop(); return; }
+        if (layerPop.contains(e.target) || layerBtn.contains(e.target)) return;
+        closeLayerPop();
+    });
+
+    // 图层相关的 UI 状态统一在这里刷：按钮文字、列表、灰度滑块
+    function refreshLayerUI() {
+        if (!layers.length) activeLayer = -1;
+        else if (activeLayer >= layers.length) activeLayer = layers.length - 1;
+        const L = activeLayer >= 0 ? layers[activeLayer] : null;
+        layerBtn.textContent = L ? L.name : "图层";
+        layerBtn.classList.toggle("is-on", layerPop.style.display === "flex");
         delLayerBtn.disabled = activeLayer < 0;
+        renderLayerList();
+        syncGray();
     }
 
     // 提示放 title，避免占掉一整行（面板只有 520px 宽）
@@ -1771,11 +2149,13 @@ export function createDepthEditor({
         moveBtn.disabled = layers.length === 0;
         cropBtn.classList.toggle("is-on", cropMode);
         cropBtn.disabled = activeLayer < 0;
-        if (layerSelect) {
-            layerSelect.value = String(activeLayer);
-            layerSelect.disabled = layers.length === 0;
-        }
         if (delLayerBtn) delLayerBtn.disabled = activeLayer < 0;
+        // 按钮文字只在选中的层变了之后才有意义，跟着一起刷
+        if (layerBtn) {
+            const L = activeLayer >= 0 ? layers[activeLayer] : null;
+            layerBtn.textContent = L ? L.name : "图层";
+            layerBtn.disabled = layers.length === 0;
+        }
         grayRange.value = String(value);
         if (grayNum.dataset.editing !== "1") grayNum.textContent = String(value);
     }
@@ -1842,7 +2222,7 @@ export function createDepthEditor({
     }
 
 
-    rebuildLayerSelect();
+    refreshLayerUI();
     syncTools();
     bindKeys();
 
