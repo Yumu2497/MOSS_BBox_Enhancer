@@ -4,6 +4,7 @@ import { createEditorModel } from "./editor-model.js";
 import { createRibbon, openPopover, closePopover } from "./ribbon.js";
 import { createDepthEditor } from "./depth-editor.js";
 import { hitRect, cursorForHit } from "./handles.js";
+import { createListDrag } from "./list-drag.js";
 import { createToast } from "./toast.js";
 import { createPresetPanel } from "./preset-panel.js";
 import { getPluginVersion, onPluginVersion } from "../core/version.js";
@@ -140,7 +141,7 @@ export function createFloatingPanel(node, jsonWidget) {
             setBgActiveIndex(bgLayers.length - 1);
             bgActive = true;
             leaveDepthMode();
-            setRightTab("bg"); // 手动导入时切到背景页，省得还要自己点一下
+            setRightTab("bg", { silent: true }); // 手动导入时切到背景页（模式上面已经设过了）
         }
         bgVisible = true;
         syncBgMode?.();
@@ -873,9 +874,6 @@ export function createFloatingPanel(node, jsonWidget) {
     const tagStyle = document.createElement("style");
     tagStyle.id = `moss-tag-style-${node.id}`;
     tagStyle.textContent = `
-.moss-grip { flex: 0 0 auto; padding: 0 1px; color: #666; font-size: 13px; line-height: 1; letter-spacing: -1px; cursor: grab; user-select: none; transition: color 0.12s; }
-.moss-grip:hover { color: #bbb; }
-.moss-grip:active { cursor: grabbing; }
 .moss-row-placeholder { flex: 0 0 auto; border-radius: 4px; border: 1px dashed #4a9eff; background: rgba(74, 158, 255, 0.10); }
 .moss-editor > * { flex-shrink: 0; }
 .moss-editor .moss-tag { display: inline-block; padding: 3px 8px; border: 1px solid #555; border-radius: 12px; background: #333; color: #ccc; font-size: 11px; line-height: 1.4; cursor: pointer; user-select: none; transition: background 0.12s, border-color 0.12s, color 0.12s; }
@@ -2152,27 +2150,30 @@ export function createFloatingPanel(node, jsonWidget) {
     bgBar.appendChild(bgDetectHint); // 顺序调到末尾，提示出现时不打断工具条排列
 
     const listArea = document.createElement("div");
+    // 和背景 / 深度的列表共用 .moss-layer-list：同样的 6px 内边距、2px 行距
     // min-width: 0 让列表可以被父级压缩，而不是用内容宽度把右栏顶宽
-    listArea.style.cssText =
-        "display: flex; flex-direction: column; gap: 4px; padding: 10px; overflow-y: auto; overflow-x: hidden; flex: 1; min-width: 0;";
+    listArea.className = "moss-layer-list";
+    listArea.style.cssText = "overflow-x: hidden; min-width: 0;";
 
     // ================= 右栏：三层列表（框 / 背景 / 深度） =================
     // 三个页签共用一套行样式（.moss-layer-row），数据仍各归各的：
     // 框在 model.items，背景在 bgImage，深度在 depthEditor.layers。
     const layerPanel = document.createElement("div");
     layerPanel.style.cssText =
-        "display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; margin: 10px 10px 10px;" +
+        "display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; min-width: 0; box-sizing: border-box; margin: 10px 10px 10px;" +
         "border: 1px solid #35373c; border-radius: 6px; overflow: hidden; background: #1b1c1f;";
 
     const layerTabs = document.createElement("div");
     layerTabs.style.cssText = "display: flex; flex: 0 0 auto; border-bottom: 1px solid #35373c;";
 
     const layerPanes = document.createElement("div");
-    layerPanes.style.cssText = "position: relative; flex: 1 1 auto; min-height: 0; display: flex;";
+    // min-width: 0：允许被父级压缩，不然列表里一行长文本能把整个右栏顶宽
+    layerPanes.style.cssText = "position: relative; flex: 1 1 auto; min-height: 0; min-width: 0; display: flex;";
 
     const makePane = () => {
         const p = document.createElement("div");
-        p.style.cssText = "display: none; flex: 1 1 auto; min-height: 0; flex-direction: column;";
+        p.style.cssText =
+            "display: none; flex: 1 1 auto; min-height: 0; min-width: 0; flex-direction: column;";
         layerPanes.appendChild(p);
         return p;
     };
@@ -2195,12 +2196,17 @@ export function createFloatingPanel(node, jsonWidget) {
     mkTab("depth");
 
     let rightTab = "box";
-    function setRightTab(key) {
+    // 页签和顶部模式按钮联动。模式函数（setBgMode / syncDepthBtn / drawCanvas）定义在后面，
+    // 构建期还可能踩 TDZ，所以这里只留钩子，等工具条建完再填实现。
+    const tabModeHooks = { enter: null };
+    function setRightTab(key, opt) {
         rightTab = key;
         [["box", paneBox], ["bg", paneBg], ["depth", paneDepth]].forEach(([k, p]) => {
             p.style.display = k === key ? "flex" : "none";
             tabBtns[k].classList.toggle("is-on", k === key);
         });
+        // silent：只换页签，不动模式（顶部按钮自己已经处理过模式了，避免来回打架）
+        if (!opt || !opt.silent) tabModeHooks.enter?.(key);
     }
     function updateTabLabels() {
         if (!modelReady) return;
@@ -2242,7 +2248,26 @@ export function createFloatingPanel(node, jsonWidget) {
     // ---- 背景图层列表：拖动排序 / 选中 / 显隐 / 锁定 / 改名 / 删除 ----
 
     const bgSel = new Set();
-    let bgRowDrag = null;
+    // 和框页共用同一套拖拽：浮起 + 虚线占位 + FLIP 让位，拖动期间不重建列表
+    const bgListDrag = createListDrag({
+        container: bgListArea,
+        panel,
+        rowFilter: (el) => el.classList.contains("moss-layer-row"),
+        onDrop: (fromDisp, toDisp) => {
+            if (fromDisp !== toDisp) {
+                const active = activeBgLayer();
+                const disp = bgLayers.slice().reverse(); // 显示顺序 = 顶到底
+                const [moved] = disp.splice(fromDisp, 1);
+                disp.splice(toDisp, 0, moved);
+                bgLayers = disp.reverse();
+                bgActiveIndex = active ? bgLayers.indexOf(active) : -1;
+                safeRedraw();
+                scheduleBgPersist(120);
+            }
+            renderBgList();
+        },
+        onCancel: () => renderBgList(),
+    });
 
     const bgFoot = document.createElement("div");
     bgFoot.className = "moss-layer-foot";
@@ -2307,25 +2332,39 @@ export function createFloatingPanel(node, jsonWidget) {
 
         // 从顶到底显示
         const disp = bgLayers.slice().reverse();
-        disp.forEach((L) => {
+        disp.forEach((L, dispIndex) => {
             const row = document.createElement("div");
             row.className = "moss-layer-row";
             if (bgLayers.indexOf(L) === bgActiveIndex) row.classList.add("is-active");
             if (bgSel.has(L)) row.classList.add("is-sel");
-            if (bgRowDrag && bgRowDrag.layer === L) row.classList.add("is-drag");
             if (L.visible === false) row.classList.add("is-hidden");
 
             const handle = document.createElement("span");
             handle.className = "moss-layer-handle";
             handle.textContent = "≡";
             handle.title = "按住拖动改前后顺序（上面的盖住下面的）";
-            handle.addEventListener("mousedown", (e) => {
+            handle.addEventListener("pointerdown", (e) => {
                 if (e.button !== 0) return;
-                e.preventDefault();
+                bgListDrag.begin(e, row, dispIndex);
+            });
+
+            // 勾选盒：多选的肉眼入口（Ctrl/Shift 点行仍然可用）
+            const chk = document.createElement("span");
+            chk.className = "moss-layer-chk";
+            chk.classList.toggle("is-on", bgSel.has(L));
+            chk.textContent = bgSel.has(L) ? "✓" : "";
+            chk.title = "勾选可多选，选中后底部出现批量操作";
+            chk.addEventListener("mousedown", (e) => e.stopPropagation());
+            chk.addEventListener("click", (e) => {
                 e.stopPropagation();
-                bgRowDrag = { layer: L, startY: e.clientY, moved: false };
-                window.addEventListener("mousemove", onBgRowDragMove);
-                window.addEventListener("mouseup", endBgRowDrag);
+                if (bgSel.has(L)) bgSel.delete(L);
+                else bgSel.add(L);
+                if (bgSel.has(L)) {
+                    setBgActiveByLayer(L);
+                    if (!bgLocked) setBgMode(true);
+                }
+                renderBgList();
+                renderBgFoot();
             });
 
             const name = document.createElement("span");
@@ -2340,7 +2379,7 @@ export function createFloatingPanel(node, jsonWidget) {
             const lock = document.createElement("span");
             lock.className = "moss-layer-flag";
             lock.textContent = "锁";
-            lock.style.color = L.locked ? "#ffa94d" : "#5d6167";
+            lock.style.color = L.locked ? "#ffa94d" : "#9aa0a6";
             lock.title = L.locked ? "已锁定，点击解锁" : "锁定：画布上不能拖动/拉伸";
             lock.addEventListener("mousedown", (e) => e.stopPropagation());
             lock.addEventListener("click", (e) => {
@@ -2366,8 +2405,12 @@ export function createFloatingPanel(node, jsonWidget) {
                 scheduleBgPersist();
             });
 
-            row.append(handle, name, lock, eye);
+            row.append(handle, chk, name, lock, eye);
             row.addEventListener("click", (e) => {
+                if (e.target.closest?.(".moss-layer-handle")) return; // 拖动柄不触发选中
+                if (e.target.closest?.(".moss-layer-chk")) return;
+                if (e.target.closest?.(".moss-layer-flag")) return;
+                if (e.target.closest?.(".moss-layer-eye")) return;
                 const multi = e.ctrlKey || e.metaKey || e.shiftKey;
                 if (multi) {
                     if (bgSel.has(L)) bgSel.delete(L);
@@ -2400,7 +2443,7 @@ export function createFloatingPanel(node, jsonWidget) {
     function renderBgFoot() {
         bgFoot.textContent = "";
         const sel = bgSelected();
-        if (sel.length < 2) return;
+        if (sel.length < 1) return;
         const info = document.createElement("span");
         info.className = "moss-layer-foot-info";
         info.textContent = `已选 ${sel.length} 项`;
@@ -2439,44 +2482,6 @@ export function createFloatingPanel(node, jsonWidget) {
             bgSel.clear();
             renderBgList();
         });
-    }
-
-    function onBgRowDragMove(e) {
-        if (!bgRowDrag) return;
-        if (!bgRowDrag.moved) {
-            if (Math.abs(e.clientY - bgRowDrag.startY) < 4) return;
-            bgRowDrag.moved = true;
-        }
-        const rows = bgListArea.querySelectorAll(".moss-layer-row");
-        const n = rows.length;
-        if (!n) return;
-        let toDisp = n - 1;
-        for (let i = 0; i < n; i += 1) {
-            const r = rows[i].getBoundingClientRect();
-            if (e.clientY < r.top + r.height / 2) { toDisp = i; break; }
-        }
-        const li = bgLayers.indexOf(bgRowDrag.layer);
-        if (li < 0) return;
-        const fromDisp = bgLayers.length - 1 - li;
-        if (toDisp === fromDisp) return;
-        const active = activeBgLayer();
-        const disp = bgLayers.slice().reverse();
-        disp.splice(fromDisp, 1);
-        disp.splice(toDisp, 0, bgRowDrag.layer);
-        bgLayers = disp.reverse();
-        bgActiveIndex = active ? bgLayers.indexOf(active) : -1;
-        renderBgList();
-        safeRedraw();
-    }
-
-    function endBgRowDrag() {
-        window.removeEventListener("mousemove", onBgRowDragMove);
-        window.removeEventListener("mouseup", endBgRowDrag);
-        if (!bgRowDrag) return;
-        const moved = bgRowDrag.moved;
-        bgRowDrag = null;
-        renderBgList();
-        if (moved) scheduleBgPersist(120);
     }
 
     // ---------- 背景图持久化（WebP，长边 ≤1600） ----------
@@ -2587,6 +2592,7 @@ export function createFloatingPanel(node, jsonWidget) {
     const bgBtn = ribbon.button("image", "背景图模式：进入后拖动 / 拉伸背景图", () => {
         const next = !bgActive;
         setBgMode(next);
+        setRightTab(next ? "bg" : "box", { silent: true }); // 右栏跟着切页；silent 防止回头再改模式
         if (next) toast.show("背景图模式：拖动 / 拉伸背景图，点空白处不会建框；再点一次按钮退出", 2600);
     });
 
@@ -2601,6 +2607,7 @@ export function createFloatingPanel(node, jsonWidget) {
         syncDepthBtn();
         updateUndoButtonsRef?.();
         if (on && bgActive) setBgMode(false); // 两种模式互斥，深度优先
+        setRightTab(on ? "depth" : "box", { silent: true }); // 右栏跟着切页
         if (on) toast.show("深度图模式：左键涂抹，1~5 换灰阶，再点一次按钮退出", 2600);
         drawCanvas();
     });
@@ -2618,6 +2625,34 @@ export function createFloatingPanel(node, jsonWidget) {
         bgBtn.classList.toggle("is-active", bgActive);
     };
     syncBgMode();
+
+    // 点右栏页签 = 进对应模式，顶部按钮的高亮同时跟着变；反过来点顶部按钮会 silent 切页签。
+    // 这里统一用 safeRedraw：构建期 drawCanvas 还在 TDZ 里，直接调用会炸。
+    tabModeHooks.enter = (key) => {
+        if (key === "depth") {
+            if (!depthEditor) return;
+            if (bgActive) setBgMode(false);
+            if (!depthEditor.isActive()) depthEditor.setActive(true);
+            syncDepthBtn();
+            updateUndoButtonsRef?.();
+        } else if (key === "bg") {
+            if (depthEditor?.isActive()) leaveDepthMode();
+            if (!bgActive) {
+                bgActive = true;
+                syncBgMode();
+            }
+            // 一张背景图都没有也照样进模式（点页签就是进模式），只是提醒一下怎么加图
+            if (!bgLayers.length) toast.show("背景图模式：还没有背景图，点工具条「导入」或 Ctrl+V 加一张", 2400);
+        } else {
+            // 「框」页签：把两个图像模式都退掉，回到普通框编辑
+            if (depthEditor?.isActive()) leaveDepthMode();
+            if (bgActive) {
+                bgActive = false;
+                syncBgMode();
+            }
+        }
+        safeRedraw();
+    };
 
     ribbon.group([selectAllBtn, addBtn, deleteBtn]);
 
@@ -2780,17 +2815,8 @@ export function createFloatingPanel(node, jsonWidget) {
     layerPanel.appendChild(layerTabs);
     layerPanel.appendChild(layerPanes);
     rightContainer.appendChild(layerPanel);
-    // 在「深度」页里点东西就顺手进深度模式，否则列表能点但画布不响应
-    paneDepth.addEventListener("mousedown", () => {
-        if (!depthEditor || depthEditor.isActive()) return;
-        if (bgActive) setBgMode(false);
-        depthEditor.setActive(true);
-        syncDepthBtn();
-        updateUndoButtonsRef?.();
-        drawCanvas();
-    });
 
-    setRightTab("box");
+    setRightTab("box", { silent: true }); // 初始页签不触发模式联动
     updateTabLabels();
     renderBgList();
 
@@ -3435,6 +3461,7 @@ export function createFloatingPanel(node, jsonWidget) {
         onRedraw: () => drawCanvas(),
         onHistoryChange: () => updateUndoButtonsRef?.(),
         layersHost: paneDepth,
+        panel,
         onLayersChanged: () => updateTabLabels(),
         // 图层吸附跟随顶部的「无 / 对象 / 网格」设置
         getSnapMode: () => snapMode,
@@ -3689,17 +3716,17 @@ export function createFloatingPanel(node, jsonWidget) {
         recordHistory(jsonWidget.value);
 
         // 实时更新右侧列表的文本显示（不整体重建列表，防止失去焦点）
-        // ⚠️ 必须按类名找：行首现在是拖动柄 span，querySelector("span") 会抓错元素
         if (model.active >= 0) {
-            const cbs = listArea.querySelectorAll("input[type='checkbox']");
-            const row = cbs[model.active]?.parentElement;
+            const row = listArea.querySelector(`.moss-layer-row[data-index="${model.active}"]`);
             if (row) {
-                const span = row.querySelector(".moss-row-label");
+                const span = row.querySelector(".moss-layer-name");
                 const item = model.items[model.active];
                 const text =
                     item.caption || item.desc || `未命名 (${item.label || "object"})`;
-                if (span)
-                    span.textContent = `${model.active + 1}. ${text.length > 15 ? text.substring(0, 15) + "..." : text}`;
+                if (span) {
+                    span.textContent = `${model.active + 1}. ${text}`;
+                    span.title = `${text}（按住 ≡ 可排序）`;
+                }
             }
         }
 
@@ -4489,9 +4516,17 @@ export function createFloatingPanel(node, jsonWidget) {
             if (!hitMode) {
                 const idx = pickBgLayer(mouseX, mouseY);
                 if (idx >= 0 && idx !== bgActiveIndex) {
+                    // 与框一致：点画布 = 只选这一层，右栏同时高亮 + 勾选
+                    bgSelectOnly(bgLayers[idx]);
                     setBgActiveIndex(idx);
                     hitMode = getBgHitMode(mouseX, mouseY) || "move";
                 }
+            }
+            // 点的就是当前层（含控制点）时，也把勾选同步成「只勾这一层」
+            const picked = bgActiveIndex >= 0 ? bgLayers[bgActiveIndex] : null;
+            if (picked && (bgSel.size !== 1 || !bgSel.has(picked))) {
+                bgSelectOnly(picked);
+                renderBgList();
             }
             if (hitMode) {
                 bgDragMode = hitMode;
@@ -5750,15 +5785,18 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     const updateListSelection = () => {
-        const cbs = listArea.querySelectorAll("input[type='checkbox']");
-        Array.from(listArea.children).forEach((child, i) => {
+        // 行改成 class 化的 .moss-layer-row 后只切 class，不再写 inline 背景/边框
+        Array.from(listArea.children).forEach((child) => {
+            if (!child.dataset || child.dataset.index === undefined) return;
+            const i = Number(child.dataset.index);
             const isSel = model.selection.has(i);
-            if (cbs[i]) cbs[i].checked = isSel;
-
-            child.style.background =
-                i === model.active ? "#324664" : isSel ? "#2a3a4f" : "#2a2a2a";
-            child.style.borderColor =
-                i === model.active ? "#5c8ccb" : isSel ? "#4a7ab5" : "#333";
+            child.classList.toggle("is-active", i === model.active);
+            child.classList.toggle("is-sel", isSel && i !== model.active);
+            const chk = child.querySelector(".moss-layer-chk");
+            if (chk) {
+                chk.classList.toggle("is-on", isSel);
+                chk.textContent = isSel ? "✓" : "";
+            }
         });
         selectAllBtn.classList.toggle(
             "is-active",
@@ -6192,183 +6230,47 @@ export function createFloatingPanel(node, jsonWidget) {
         }
     };
 
-    // ================= 列表拖动排序 =================
-    let listDrag = null;
-
-    const listRows = () =>
-        Array.from(listArea.children).filter((el) => el.dataset && el.dataset.index !== undefined);
-
-    const snapshotTops = (rows) => {
-        const map = new Map();
-        rows.forEach((el) => map.set(el, el.getBoundingClientRect()));
-        return map;
-    };
-
-    // FLIP：先反向位移，再过渡回原位，得到平滑的让位动画
-    const animateRows = (rows, beforeMap) => {
-        rows.forEach((el) => {
-            const before = beforeMap.get(el);
-            if (!before) return;
-            const after = el.getBoundingClientRect();
-            const dy = before.top - after.top;
-            if (Math.abs(dy) < 1) return;
-            el.style.transition = "none";
-            el.style.transform = `translateY(${dy}px)`;
-            void el.offsetHeight; // 强制回流，让上面的位移立即生效
-            el.style.transition = "transform 0.16s cubic-bezier(0.2, 0.8, 0.3, 1)";
-            el.style.transform = "";
-        });
-    };
-
-    const onRowDragMove = (e) => {
-        if (!listDrag) return;
-        const { row, placeholder } = listDrag;
-        // 拖动期间列表被重建（例如外部触发了 renderList），直接放弃这次拖动
-        if (!row.isConnected || !placeholder.isConnected) return;
-
-        row.style.top = `${e.clientY - listDrag.grabOffsetY - listDrag.panelTop}px`;
-
-        const rowsNow = listRows().filter((el) => el !== row);
-        const beforeMap = snapshotTops(rowsNow);
-        const others = rowsNow.filter((el) => el !== placeholder);
-
-        // 指针落在哪一行的上半部之前，就插到那一行前面
-        let ref = null;
-        for (const el of others) {
-            const r = el.getBoundingClientRect();
-            if (e.clientY < r.top + r.height / 2) {
-                ref = el;
-                break;
+    // ================= 列表拖动排序（三页共用 list-drag.js，手感完全一致） =================
+    const boxListDrag = createListDrag({
+        container: listArea,
+        panel,
+        rowFilter: (el) => el.dataset && el.dataset.index !== undefined,
+        onDrop: (fromIndex, toIndex) => {
+            if (toIndex === fromIndex) {
+                updateListSelection();
+                return;
             }
-        }
-
-        const alreadyThere = ref
-            ? placeholder.nextElementSibling === ref
-            : placeholder === listArea.lastElementChild;
-        if (alreadyThere) return;
-
-        if (ref) listArea.insertBefore(placeholder, ref);
-        else listArea.appendChild(placeholder);
-
-        animateRows(rowsNow, beforeMap);
-    };
-
-    const onRowDragEnd = () => {
-        if (!listDrag) return;
-        const { row, placeholder, fromIndex, origCss } = listDrag;
-
-        window.removeEventListener("pointermove", onRowDragMove);
-        window.removeEventListener("pointerup", onRowDragEnd);
-        window.removeEventListener("pointercancel", onRowDragEnd);
-        document.body.style.userSelect = "";
-        document.body.style.cursor = "";
-
-        row.classList.remove("is-dragging");
-        row.style.cssText = origCss;
-
-        // 占位符已经被列表重建清掉时，只要把行收回来即可
-        if (!placeholder.isConnected) {
-            row.remove();
-            listDrag = null;
+            // 重排数据并写回 JSON
+            const [moved] = model.items.splice(fromIndex, 1);
+            model.items.splice(toIndex, 0, moved);
+            try {
+                let parsed = JSON.parse(jsonWidget.value || "{}");
+                if (Array.isArray(parsed)) {
+                    parsed = model.items;
+                } else {
+                    parsed.items = model.items;
+                }
+                isUpdatingFromUI = true;
+                jsonWidget.value = serializeLayout(parsed);
+                if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
+                isUpdatingFromUI = false;
+                recordHistory(jsonWidget.value, false);
+            } catch (err) {
+                console.error("[MOSS] 排序写回失败:", err);
+            }
             renderList();
-            return;
-        }
-
-        // 占位符前面有多少个真实行，就是新的落点
-        const all = Array.from(listArea.children);
-        const toIndex = all
-            .slice(0, all.indexOf(placeholder))
-            .filter((el) => el.dataset.index !== undefined).length;
-
-        listArea.insertBefore(row, placeholder);
-        placeholder.remove();
-        listDrag = null;
-
-        if (toIndex === fromIndex) {
+            model.selection.clear();
+            model.selection.add(toIndex);
+            model.setActive(toIndex);
             updateListSelection();
-            return;
-        }
+            syncEditorPanel();
+            drawCanvas();
+            if (node.graph) node.graph.setDirtyCanvas(true, true);
+        },
+        onCancel: () => renderList(),
+    });
 
-        // 重排数据并写回 JSON
-        const [moved] = model.items.splice(fromIndex, 1);
-        model.items.splice(toIndex, 0, moved);
-
-        try {
-            let parsed = JSON.parse(jsonWidget.value || "{}");
-            if (Array.isArray(parsed)) {
-                parsed = model.items;
-            } else {
-                parsed.items = model.items;
-            }
-            isUpdatingFromUI = true;
-            jsonWidget.value = serializeLayout(parsed);
-            if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
-            isUpdatingFromUI = false;
-            recordHistory(jsonWidget.value, false);
-        } catch (err) {
-            console.error("[MOSS] 排序写回失败:", err);
-        }
-
-        renderList();
-        model.selection.clear();
-        model.selection.add(toIndex);
-        model.setActive(toIndex);
-        updateListSelection();
-        syncEditorPanel();
-        drawCanvas();
-        if (node.graph) node.graph.setDirtyCanvas(true, true);
-    };
-
-    const beginRowDrag = (e, row, index) => {
-        if (listDrag || model.items.length < 2) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        const rect = row.getBoundingClientRect();
-        const panelRect = panel.getBoundingClientRect();
-        const placeholder = document.createElement("div");
-        placeholder.className = "moss-row-placeholder";
-        placeholder.style.height = `${rect.height}px`;
-        placeholder.style.boxSizing = "border-box";
-
-        const origCss = row.style.cssText;
-        row.parentElement.insertBefore(placeholder, row);
-
-        row.dataset.index = String(index);
-        row.classList.add("is-dragging");
-        // 🌟 挂在主面板内部并用面板相对坐标：
-        // 挂到 body 上会受页面变换/视口影响，可能撑出滚动条把左侧画布挤窄
-        row.style.position = "absolute";
-        row.style.boxSizing = "border-box";
-        row.style.left = `${rect.left - panelRect.left}px`;
-        row.style.top = `${rect.top - panelRect.top}px`;
-        row.style.width = `${rect.width}px`;
-        row.style.height = `${rect.height}px`;
-        row.style.margin = "0";
-        row.style.zIndex = "9999";
-        row.style.pointerEvents = "none";
-        row.style.opacity = "0.98";
-        row.style.boxShadow = "0 12px 26px rgba(0, 0, 0, 0.65)";
-        row.style.transition = "box-shadow 0.15s ease";
-        panel.appendChild(row);
-
-        listDrag = {
-            row,
-            placeholder,
-            fromIndex: index,
-            origCss,
-            grabOffsetY: e.clientY - rect.top,
-            pointerId: e.pointerId,
-            panelTop: panelRect.top,
-        };
-
-        document.body.style.userSelect = "none";
-        document.body.style.cursor = "grabbing";
-
-        window.addEventListener("pointermove", onRowDragMove);
-        window.addEventListener("pointerup", onRowDragEnd);
-        window.addEventListener("pointercancel", onRowDragEnd);
-    };
+    const beginRowDrag = (e, row, index) => boxListDrag.begin(e, row, index);
 
     const renderList = (resetActive = true) => {
         // 角标跟着列表数量走，放在最前面，后面提前 return 也能更新
@@ -6400,93 +6302,109 @@ export function createFloatingPanel(node, jsonWidget) {
                 }
             });
         } catch (e) {
-            listArea.innerHTML = "<div style='color:#888;'>JSON 格式错误</div>";
+            listArea.innerHTML = "<div class='moss-layer-empty'>JSON 格式错误</div>";
             drawCanvas();
             return;
         }
 
         if (model.items.length === 0) {
-            listArea.innerHTML = "<div style='color:#888;'>当前没有边界框</div>";
+            listArea.innerHTML = "<div class='moss-layer-empty'>当前没有边界框</div>";
             drawCanvas();
             return;
         }
 
         model.items.forEach((item, index) => {
-            const row = document.createElement("div");
             // 🌟 极小框红色高亮
             const realW = item.bbox[3] - item.bbox[1];
             const realH = item.bbox[2] - item.bbox[0];
             const isExtreme = realW < GRID_SNAP || realH < GRID_SNAP;
-            
-            row.style.cssText = `display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: #2a2a2a; border-radius: 4px; border: 1px solid ${isExtreme ? '#ff4a4a' : '#333'}; flex-shrink: 0; min-width: 0; cursor: pointer;`;
+
+            // 和「背景 / 深度」两页共用 .moss-layer-row：行高、悬停、选中色、拖动让位动画全一致
+            const row = document.createElement("div");
+            row.className = "moss-layer-row";
+            // 布局关键项写 inline 兜底：class 万一没加载/被覆盖，行也一定是定宽 flex 容器，
+            // 长文本不会把行撑出列表（这正是锁被裁掉的原因）
+            row.style.cssText =
+                "display: flex; align-items: center; gap: 5px; height: 24px; padding: 0 4px;" +
+                "box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0;" +
+                "flex: 0 0 auto; overflow: hidden;";
+            if (isExtreme) row.classList.add("is-extreme");
+            if (model.selection.has(index)) row.classList.add("is-sel");
+            if (model.active === index) row.classList.add("is-active");
             row.dataset.index = String(index);
 
-            // 🌟 左侧六点拖动柄：按住即可上下拖动排序
+            // 🌟 拖动柄：按住即可上下拖动排序（松手有让位动画）
             const grip = document.createElement("span");
-            grip.className = "moss-grip";
-            grip.textContent = "⠿";
+            grip.className = "moss-layer-handle";
+            grip.textContent = "≡";
             grip.title = "按住拖动排序";
             grip.addEventListener("pointerdown", (e) => beginRowDrag(e, row, index));
 
-            const cb = document.createElement("input");
-            cb.type = "checkbox";
-            cb.dataset.index = index;
-            cb.checked = model.selection.has(index);
-            cb.style.cssText = "cursor: pointer; accent-color: #4a9eff;";
-
-            cb.addEventListener("change", () => {
-                if (cb.checked) {
-                    model.selection.add(index);
-                    model.setActive(index);
-                } else {
-                    model.selection.delete(index);
-                    if (model.active === index) model.setActive(-1);
-                }
+            // 勾选盒：和另外两页同一个，点它切多选
+            const isSel = model.selection.has(index);
+            const chk = document.createElement("span");
+            chk.className = "moss-layer-chk";
+            chk.classList.toggle("is-on", isSel);
+            chk.textContent = isSel ? "✓" : "";
+            chk.title = "勾选可多选，选中后底部出现批量操作";
+            chk.addEventListener("mousedown", (e) => e.stopPropagation());
+            chk.addEventListener("click", (e) => {
+                e.stopPropagation();
+                if (model.selection.has(index)) model.selection.delete(index);
+                else model.selection.add(index);
+                if (model.selection.has(index)) model.setActive(index);
+                else if (model.active === index) model.setActive(-1);
                 updateListSelection();
                 syncEditorPanel();
                 drawCanvas();
             });
 
             row.addEventListener("click", (e) => {
-                if (e.target.closest?.(".moss-grip")) return; // 拖动柄不触发选中
-                if (e.target !== cb && e.target.tagName !== "BUTTON") {
-                    if (e.ctrlKey || e.metaKey) {
-                        cb.checked = !cb.checked;
-                    } else {
-                        if (!cb.checked) {
-                            model.selection.clear();
-                            cb.checked = true;
-                        }
-                    }
-                    cb.dispatchEvent(new Event("change"));
+                // 拖动柄 / 勾选盒 / 锁自己处理，不参与「点行选中」
+                if (e.target.closest?.(".moss-layer-handle")) return;
+                if (e.target.closest?.(".moss-layer-chk")) return;
+                if (e.target.closest?.(".moss-layer-flag")) return;
+                if (e.ctrlKey || e.metaKey) {
+                    if (model.selection.has(index)) model.selection.delete(index);
+                    else model.selection.add(index);
+                } else {
+                    model.selection.clear();
+                    model.selection.add(index);
                 }
+                model.setActive(model.selection.has(index) ? index : -1);
+                updateListSelection();
+                syncEditorPanel();
+                drawCanvas();
             });
 
             const label = document.createElement("span");
-            label.className = "moss-row-label";
+            label.className = "moss-layer-name";
+            // inline 兜底：就算 class 没生效，也不许长文本把行撑宽（display:block 保证它按容器宽算）
+            label.style.cssText =
+                "flex: 1 1 0; min-width: 0; max-width: 100%; display: block;" +
+                "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
             let text = item.caption || item.desc || `未命名 (${item.label || "object"})`;
             if (isExtreme) text = `[极小框 ${realW}x${realH}] ${text}`; // 显示真实尺寸
-            
-            label.textContent = `${index + 1}. ${text.length > 15 ? text.substring(0, 15) + "..." : text}`;
-            label.style.cssText = `color: ${isExtreme ? '#ff4a4a' : '#ccc'}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; pointer-events: none;`;
+            label.textContent = `${index + 1}. ${text}`; // 超宽交给 CSS 省略号，别在这截断
+            label.title = `${text}（按住 ≡ 可排序）`;
 
-            // 🌟 锁定按钮
-            const lockBtn = document.createElement("button");
-            lockBtn.textContent = item._locked ? "🔒" : "🔓";
-            lockBtn.title = item._locked ? "已锁住，点击解锁" : "锁住框，禁止拖动";
-            lockBtn.style.cssText = "background: transparent; border: none; cursor: pointer; font-size: 14px; padding: 0;";
-            lockBtn.onclick = (e) => {
+            // 🌟 锁定：和另外两页同一个 .moss-layer-flag，固定 13px，挤不掉
+            const lock = document.createElement("span");
+            lock.className = "moss-layer-flag";
+            lock.textContent = "锁";
+            lock.style.color = item._locked ? "#ffa94d" : "#9aa0a6";
+            lock.title = item._locked ? "已锁住，点击解锁" : "锁住框，禁止拖动";
+            lock.addEventListener("mousedown", (e) => e.stopPropagation());
+            lock.addEventListener("click", (e) => {
                 e.stopPropagation();
                 item._locked = !item._locked;
-                lockBtn.textContent = item._locked ? "🔒" : "🔓";
+                lock.style.color = item._locked ? "#ffa94d" : "#9aa0a6";
+                lock.title = item._locked ? "已锁住，点击解锁" : "锁住框，禁止拖动";
                 // 锁定状态不存入 JSON，只是前端内存状态
                 drawCanvas();
-            };
+            });
 
-            row.appendChild(grip);
-            row.appendChild(cb);
-            row.appendChild(label);
-            row.appendChild(lockBtn);
+            row.append(grip, chk, label, lock);
             listArea.appendChild(row);
         });
 
