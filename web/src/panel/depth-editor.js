@@ -28,7 +28,7 @@ function ensureStyle() {
     style.id = STYLE_ID;
     style.textContent = `
 .moss-mode-bar {
-    display: none; align-items: center; gap: 6px 8px; flex: 0 0 auto;
+    display: none; align-items: center; gap: 6px 8px; flex: 0 0 auto; position: relative;
     flex-wrap: wrap; min-height: 32px; padding: 5px 8px; box-sizing: border-box;
     background: var(--moss-bg, #232428);
     border-bottom: 1px solid var(--moss-divider, #34363b);
@@ -71,7 +71,7 @@ function ensureStyle() {
     font-variant-numeric: tabular-nums; outline: none;
 }
 .moss-layer-pop {
-    position: fixed; z-index: 60; display: none; flex-direction: column;
+    position: absolute; z-index: 60; display: none; flex-direction: column;
     min-width: 168px; max-height: 224px; overflow-y: auto; padding: 4px;
     background: #26272b; border: 1px solid #45484e; border-radius: 6px;
     box-shadow: 0 8px 20px rgba(0, 0, 0, .45); box-sizing: border-box;
@@ -2095,10 +2095,15 @@ export function createDepthEditor({
 
     function openLayerPop() {
         renderLayerList();
-        const r = layerBtn.getBoundingClientRect();
-        layerPop.style.left = `${Math.round(r.left)}px`;
-        layerPop.style.top = `${Math.round(r.bottom + 4)}px`;
+        // 相对工具条定位（工具条 position: relative）。
+        // 不能用 getBoundingClientRect + position: fixed：面板带 transform / backdrop-filter，
+        // 会变成定位包含块，fixed 坐标全错，而且弹层会被面板的 overflow: hidden 裁掉。
         layerPop.style.display = "flex";
+        layerPop.style.top = `${layerBtn.offsetTop + layerBtn.offsetHeight + 4}px`;
+        // 先摆到按钮下方，再按实际宽度右边界收一下，避免贴到面板右侧被裁
+        layerPop.style.left = "0px";
+        const maxLeft = Math.max(4, el.clientWidth - layerPop.offsetWidth - 6);
+        layerPop.style.left = `${Math.max(4, Math.min(layerBtn.offsetLeft, maxLeft))}px`;
         layerBtn.classList.add("is-on");
     }
 
@@ -2154,7 +2159,8 @@ export function createDepthEditor({
         if (layerBtn) {
             const L = activeLayer >= 0 ? layers[activeLayer] : null;
             layerBtn.textContent = L ? L.name : "图层";
-            layerBtn.disabled = layers.length === 0;
+            // 不置灰：没有图层时点开也能看到空状态，知道该先导入
+            layerBtn.classList.toggle("is-empty", layers.length === 0);
         }
         grayRange.value = String(value);
         if (grayNum.dataset.editing !== "1") grayNum.textContent = String(value);
