@@ -46,6 +46,33 @@ export const jsonImporterExtension = {
                     hWidget.callback?.(hWidget.value); 
                 }
 
+                // 深度图先处理：它和背景图互相独立，别被前面任何一步的异常带掉
+                const hasDepthFirst = message && Array.isArray(message.depth_images)
+                    && message.depth_images.length;
+                if (hasDepthFirst) {
+                    const dinfo = message.depth_images[0];
+                    if (dinfo && dinfo.filename) {
+                        const durl = `/view?filename=${encodeURIComponent(dinfo.filename)}`
+                            + `&subfolder=${encodeURIComponent(dinfo.subfolder || "")}`
+                            + `&type=${encodeURIComponent(dinfo.type || "temp")}`;
+                        const dimg = new Image();
+                        dimg.crossOrigin = "anonymous";
+                        dimg.onload = () => {
+                            try {
+                                if (node._mossPanelDepth) {
+                                    node._mossPanelDepth({ img: dimg, key: durl });
+                                } else {
+                                    node._mossPendingDepth = { img: dimg, key: durl };
+                                }
+                            } catch (err) {
+                                console.error("[MOSS] 注入深度图图层失败:", err);
+                            }
+                        };
+                        dimg.onerror = () => console.warn("[MOSS] 深度图输入加载失败:", durl);
+                        dimg.src = durl;
+                    }
+                }
+
                 const hasBg = message && Array.isArray(message.background_images)
                     && message.background_images.length;
                 if (hasBg) {
@@ -288,6 +315,32 @@ export const jsonImporterExtension = {
             node._mossPanelUpdate = null;
             node._mossPendingBackground = null;
 
+            // 🌟 老工作流里的节点是按当时的 6 个输出存下来的，加载后不会自动长出第 7 个槽。
+            // 这里补一个「深度图」输出；0~5 号索引不变，已有连线不受影响。
+            const patchDepthOutput = () => {
+                try {
+                    if (!Array.isArray(node.outputs)) return;
+                    if (node.outputs.some((o) => o && o.name === "深度图")) return;
+                    if (typeof node.addOutput !== "function") return;
+                    node.addOutput("深度图", "IMAGE");
+                    if (node.computeSize && Array.isArray(node.size)) {
+                        node.setSize([node.size[0], node.computeSize()[1]]);
+                    }
+                    node.graph?.setDirtyCanvas?.(true, true);
+                } catch (_) { /* 补不上就算了，不影响其它功能 */ }
+            };
+            patchDepthOutput();
+            setTimeout(patchDepthOutput, 0);
+            setTimeout(patchDepthOutput, 300);
+            if (node.onConfigure) {
+                const origOnConfigure = node.onConfigure;
+                node.onConfigure = function (...args) {
+                    const ret = origOnConfigure.apply(this, args);
+                    patchDepthOutput();
+                    return ret;
+                };
+            }
+
             node.addWidget("button", "📋 打开边界框管理面板", null, () => {
                 createFloatingPanel(node, jsonWidget);
             });
@@ -295,15 +348,23 @@ export const jsonImporterExtension = {
             // 🌟 JSON 控件下方的「复制 / 复制(带长宽)」按钮
             attachJsonCopyButtons(node, jsonWidget);
 
-            // 🌟 框色表：面板写入的隐藏控件，只喂给「边界框」输出，不进入 layout_json
+            // 🌟 内部数据控件（框色表、面板深度图）：值要跟着工作流存，但不占节点上的位置。
+            // 新版前端按 computeLayoutSize 排版，只改 computeSize 会留一行空白，所以两套都覆盖。
             const hideColorWidget = () => {
-                const w = node.widgets?.find((x) => x.name === "bbox_colors");
-                if (!w) return false;
-                w.computeSize = () => [0, -4];
-                w.serialize = true;
-                return true;
+                let ok = true;
+                for (const name of ["bbox_colors", "depth_png"]) {
+                    const w = node.widgets?.find((x) => x.name === name);
+                    if (!w) { ok = false; continue; }
+                    w.hidden = true;
+                    w.computeSize = () => [0, -4];
+                    w.computeLayoutSize = () => ({ minHeight: 0, maxHeight: 0, minWidth: 0, maxWidth: 0 });
+                    if (w.options) w.options.hidden = true;
+                    w.serialize = true;
+                }
+                return ok;
             };
             if (!hideColorWidget()) setTimeout(hideColorWidget, 60);
+            setTimeout(hideColorWidget, 300);
 
             // 🌟 节点被重建（例如 Ctrl+Z 触发整图 reconfigure）后自动恢复面板
             if (openPanelIds.has(node.id)) {

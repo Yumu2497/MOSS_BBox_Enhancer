@@ -2,6 +2,8 @@ import { serializeLayout, normalizeLayoutSchema } from "../core/json-schema.js";
 import { openPanelIds } from "../core/panel-registry.js";
 import { createEditorModel } from "./editor-model.js";
 import { createRibbon, openPopover, closePopover } from "./ribbon.js";
+import { createDepthEditor } from "./depth-editor.js";
+import { hitRect, cursorForHit } from "./handles.js";
 import { createToast } from "./toast.js";
 import { createPresetPanel } from "./preset-panel.js";
 import { getPluginVersion, onPluginVersion } from "../core/version.js";
@@ -39,6 +41,10 @@ export function createFloatingPanel(node, jsonWidget) {
     let bgImage = null;
     let bgOpacity = 0.5;
     let bgActive = false;
+    // 背景图工具条 / 按钮的同步入口，DOM 建好后挂上来（提前声明，避免 TDZ）
+    let syncBgMode = null;
+    // 深度编辑器的栈变化要刷新顶部撤销/重做按钮的置灰状态（定义在后面，先留引用）
+    let updateUndoButtonsRef = null;
     let bgX = 0, bgY = 0, bgW = 0, bgH = 0;
     let bgDragMode = null;
     let bgStartBBox = null;
@@ -46,9 +52,12 @@ export function createFloatingPanel(node, jsonWidget) {
     let bgInitialState = null;
     let bgSource = "none"; // 'manual' | 'auto'
 
-    // 背景图拖动时是否吸附：跟随顶部「无吸附 / 对象吸附 / 网格吸附」，
-    // 这里是背景图自己的总开关（面板里的“吸附”勾选框），取消后自由拖动
-    let bgSnap = true;
+    // 背景图裁剪：比例坐标（相对背景图），只影响显示，不动原图
+    let bgCrop = null;
+    let bgCropMode = false;
+    let bgCropOp = null;
+
+    // 背景图的吸附跟随顶部「无吸附 / 对象吸附 / 网格吸附」，没有独立开关
     // 背景图吸附命中的辅助线（和框的吸附同一套视觉：蓝色虚线）
     let bgSnapGuides = [];
     const addBgGuide = (axis, pos) => {
@@ -73,16 +82,16 @@ export function createFloatingPanel(node, jsonWidget) {
         bgInitialState = null;
         bgSource = "none";
         bgX = 0; bgY = 0; bgW = 0; bgH = 0;
-        bgActive = false;
         bgDragMode = null;
         bgSnapGuides = [];
-        if (bgActiveCb) {
-            bgActiveCb.checked = false;
-            bgActiveCb.disabled = true;
-        }
+        bgCrop = null;
+        bgCropMode = false;
+        bgCropOp = null;
+        // 不退出背景图模式：清掉后还能直接在工具条里再导入一张
+        syncBgMode?.();
         if (syncBgSizeHook) syncBgSizeHook();
         if (bgUploadInput) bgUploadInput.value = ""; 
-        drawCanvas();
+        safeRedraw();
     }
 
     // 🌟 将图片对象套用为背景图
@@ -96,25 +105,25 @@ export function createFloatingPanel(node, jsonWidget) {
         bgX = 0;
         bgY = 0;
         bgInitialState = { x: bgX, y: bgY, w: bgW, h: bgH };
-        if (bgActiveCb) bgActiveCb.disabled = false;
+        // 手动导入即进入背景图模式，省掉再去点一次按钮
+        if (source === "manual") bgActive = true;
+        syncBgMode?.();
         if (syncBgSizeHook) syncBgSizeHook();
-        if (typeof drawCanvas === "function") drawCanvas();
+        safeRedraw();
     }
 
-    // 🌟 注入面板更新接口（供 node.onExecuted 调用）
-    node._mossPanelUpdate = ({ image, clear } = {}) => {
-        if (clear) {
-            // 只有开关自动加载的图才随开关清理
-            if (bgSource === "auto") {
-                deleteBackgroundImage();
-            }
-        } else if (image) {
-            // 标记为自动来源
-            applyBackgroundImage(image, "auto");
-        } else {
+    // drawCanvas 是 const，定义在本函数很靠后的位置。节点在面板刚打开的瞬间执行时，
+    // 这里会踩 TDZ（Cannot access 'drawCanvas' before initialization），统一走重试。
+    function safeRedraw() {
+        try {
             drawCanvas();
+        } catch (_) {
+            setTimeout(() => {
+                try { drawCanvas(); } catch (_) { /* 面板还没建完，等下一次绘制 */ }
+            }, 60);
         }
-    };
+    }
+
 
     // 🌟 从 Blob/File 加载背景图（文件上传、粘贴共用）
     function loadBackgroundFromBlob(blob) {
@@ -314,6 +323,9 @@ export function createFloatingPanel(node, jsonWidget) {
     leftContainer.style.cssText =
         "flex: 1; position: relative; display: flex; flex-direction: column; border-right: 1px solid #333; overflow: hidden;";
 
+    // 深度图编辑器（在 logicToPhys 之后创建，这里先占位供按钮引用）
+    let depthEditor = null;
+
     const ribbon = createRibbon();
     leftContainer.appendChild(ribbon.el);
 
@@ -412,12 +424,25 @@ export function createFloatingPanel(node, jsonWidget) {
     };
 
     // ================= 顶部工具条：撤销 / 重做 / 重置视图 =================
-    const undoBtn = ribbon.button("undo", "撤销", () => {
+    // 这两个按钮在深度模式下复用给深度编辑器：只共按钮，不共栈
+    const undoBtn = ribbon.button("undo", "撤销（深度模式下作用于深度图，Shift 点击撤销画布）", (ev) => {
+        if (depthEditor?.isActive() && !ev?.shiftKey) {
+            if (!depthEditor.canUndo()) return;
+            depthEditor.undo();
+            toast.show("已撤销深度操作", 1000);
+            return;
+        }
         if (!model.canUndo()) return;
         undoEdit();
         toast.show("已撤销", 1000);
     });
-    const redoBtn = ribbon.button("redo", "重做", () => {
+    const redoBtn = ribbon.button("redo", "重做（深度模式下作用于深度图，Shift 点击重做画布）", (ev) => {
+        if (depthEditor?.isActive() && !ev?.shiftKey) {
+            if (!depthEditor.canRedo()) return;
+            depthEditor.redo();
+            toast.show("已重做深度操作", 1000);
+            return;
+        }
         if (!model.canRedo()) return;
         redoEdit();
         toast.show("已重做", 1000);
@@ -1547,33 +1572,38 @@ export function createFloatingPanel(node, jsonWidget) {
         drawCanvas();
     };
 
-    // 🌟 背景图设置
-    const bgSection = createSection({ title: "🖼️ 背景图设置" });
-    const bgPanel = bgSection.el;
-    const bgBody = bgSection.body;
+    // 🌟 背景图模式：和深度图一样，点 ribbon 按钮直接进模式，操作全挂在 ribbon 下方的工具条里。
+    // 不再有「操控」勾选框——按钮本身就是模式开关。
+    const bgBar = document.createElement("div");
+    bgBar.className = "moss-mode-bar moss-bg-bar";
+    ribbon.el.after(bgBar);
 
-    // 标题行右侧的「操控」开关
-    const bgTitle = bgSection.titleEl;
-    bgTitle.style.cssText = "flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;";
+    const mkBgBtn = (text, title) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "moss-mode-btn";
+        b.textContent = text;
+        if (title) b.title = title;
+        return b;
+    };
+    const mkBgSep = () => {
+        const s = document.createElement("div");
+        s.className = "moss-mode-sep";
+        return s;
+    };
+    const mkBgLabel = (text, title) => {
+        const s = document.createElement("span");
+        s.className = "moss-mode-label";
+        s.textContent = text;
+        if (title) s.title = title;
+        return s;
+    };
 
-    const bgActiveLabel = document.createElement("label");
-    bgActiveLabel.style.cssText =
-        "display: flex; align-items: center; gap: 3px; color: #ccc; font-size: var(--moss-font); font-weight: normal; cursor: pointer; flex-shrink: 0;";
-    bgActiveLabel.title = "开启后可在画布上移动 / 拉伸背景图";
-    const bgActiveCb = createCheckbox();
-    bgActiveCb.disabled = true;
-    bgActiveCb.onchange = () => { bgActive = bgActiveCb.checked; };
-    bgActiveLabel.appendChild(bgActiveCb);
-    bgActiveLabel.appendChild(document.createTextNode("操控"));
-
-    bgSection.head.appendChild(bgActiveLabel);
-
+    // 导入（label 套 file input，外观和按钮一致）/ 粘贴
     const bgUploadLabel = document.createElement("label");
-    bgUploadLabel.style.cssText = "background: #333; color: #ccc; text-align: center; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; border: 1px solid #555; flex: 1; transition: 0.2s;";
-    bgUploadLabel.textContent = "📁 导入";
-    bgUploadLabel.onmouseover = () => bgUploadLabel.style.background = "#444";
-    bgUploadLabel.onmouseout = () => bgUploadLabel.style.background = "#333";
-    
+    bgUploadLabel.className = "moss-mode-btn";
+    bgUploadLabel.textContent = "导入";
+    bgUploadLabel.title = "选一张图片作为背景图（画布聚焦时也可以 Ctrl+V 粘贴）";
     const bgUploadInput = document.createElement("input");
     bgUploadInput.type = "file";
     bgUploadInput.accept = "image/*";
@@ -1585,12 +1615,7 @@ export function createFloatingPanel(node, jsonWidget) {
     };
     bgUploadLabel.appendChild(bgUploadInput);
 
-    const bgPasteBtn = document.createElement("button");
-    bgPasteBtn.textContent = "📋 粘贴";
-    bgPasteBtn.title = "从剪贴板粘贴图片（或在画布聚焦时按 Ctrl+V）";
-    bgPasteBtn.style.cssText = "background: #333; color: #ccc; border: 1px solid #555; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; flex: 1; transition: 0.2s;";
-    bgPasteBtn.onmouseover = () => bgPasteBtn.style.background = "#444";
-    bgPasteBtn.onmouseout = () => bgPasteBtn.style.background = "#333";
+    const bgPasteBtn = mkBgBtn("粘贴", "从剪贴板粘贴图片（或在画布聚焦时按 Ctrl+V）");
     bgPasteBtn.onclick = async () => {
         try {
             if (!navigator.clipboard || !navigator.clipboard.read) {
@@ -1612,30 +1637,17 @@ export function createFloatingPanel(node, jsonWidget) {
         }
     };
 
-    const bgUploadRow = document.createElement("div");
-    bgUploadRow.style.cssText = "display: flex; gap: 6px;";
-    bgUploadRow.appendChild(bgUploadLabel);
-    bgUploadRow.appendChild(bgPasteBtn);
-    bgBody.appendChild(bgUploadRow);
-
-    // 🌟 从背景图识别人体部位（YOLO pose → 部位矩形）
-    const bgDetectBtn = document.createElement("button");
-    bgDetectBtn.textContent = "🔍 识别人体部位";
-    bgDetectBtn.title = "识别当前背景图里的人体，按面部 / 肘 / 手 / 胯 / 膝 / 脚生成边界框";
-    bgDetectBtn.style.cssText =
-        "background: #333; color: #ccc; border: 1px solid #555; padding: 6px; border-radius: 4px; cursor: pointer; font-size: 12px; width: 100%; margin-top: 6px; transition: 0.2s;";
-    bgDetectBtn.onmouseover = () => { bgDetectBtn.style.background = "#444"; };
-    bgDetectBtn.onmouseout = () => { bgDetectBtn.style.background = "#333"; };
+    const bgDetectBtn = mkBgBtn("识别人体", "识别当前背景图里的人体，按面部 / 肘 / 手 / 胯 / 膝 / 脚生成边界框");
     bgDetectBtn.onclick = () => detectPoseFromBackground(bgDetectBtn);
-    bgBody.appendChild(bgDetectBtn);
 
-    // 未导入背景图时的就地提醒：弹层 z-index 远高于画布 toast，用行内文字才不会被盖住
+    bgBar.append(bgUploadLabel, bgPasteBtn, bgDetectBtn, mkBgSep());
+
+    // 未导入背景图时的就地提醒：占满一整行显示 3 秒，不挤其它工具
     const bgDetectHint = document.createElement("div");
     bgDetectHint.style.cssText =
-        "display: none; margin-top: 5px; padding: 5px 8px; border-radius: 4px; " +
+        "display: none; flex: 1 1 100%; padding: 4px 8px; border-radius: 4px; box-sizing: border-box; " +
         "background: rgba(189, 128, 42, 0.16); border: 1px solid rgba(224, 167, 90, 0.5); " +
-        "color: #e6bd80; font-size: 11.5px; line-height: 1.45;";
-    bgBody.appendChild(bgDetectHint);
+        "color: #e6bd80; font-size: 11px; line-height: 1.4;";
 
     let poseHintTimer = null;
     function flashPoseHint(text) {
@@ -1651,29 +1663,23 @@ export function createFloatingPanel(node, jsonWidget) {
     // 脸、手、脚来自关键点/像素，尺寸本来就是量出来的，不受这个滑块影响。
     let poseScale = 1.0;
     const bgScaleRow = document.createElement("div");
-    bgScaleRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px; margin-top: 6px;";
-    const bgScaleLabel = document.createElement("span");
-    bgScaleLabel.textContent = "关节框缩放";
-    bgScaleLabel.title = "只影响肘 / 膝 / 胯的框大小；脸、手、脚按关键点生成，不受影响";
-    bgScaleLabel.style.cssText = "color: #aaa; white-space: nowrap;";
+    bgScaleRow.style.cssText = "display: flex; align-items: center; gap: 5px; flex: 0 0 auto;";
+    const bgScaleLabel = mkBgLabel("关节框", "只影响肘 / 膝 / 胯的框大小；脸、手、脚按关键点生成，不受影响");
     const bgScaleRange = document.createElement("input");
     bgScaleRange.type = "range";
     bgScaleRange.min = "0.5";
     bgScaleRange.max = "2";
     bgScaleRange.step = "0.05";
     bgScaleRange.value = "1";
-    bgScaleRange.style.flex = "1";
     const bgScaleValue = document.createElement("span");
     bgScaleValue.textContent = "1.00";
-    bgScaleValue.style.cssText = "color: #aaa; min-width: 34px; text-align: right;";
+    bgScaleValue.style.cssText = "color: #aaa; min-width: 30px; text-align: right; font-variant-numeric: tabular-nums;";
     bgScaleRange.oninput = () => {
         poseScale = parseFloat(bgScaleRange.value);
         bgScaleValue.textContent = poseScale.toFixed(2);
     };
-    bgScaleRow.appendChild(bgScaleLabel);
-    bgScaleRow.appendChild(bgScaleRange);
-    bgScaleRow.appendChild(bgScaleValue);
-    bgBody.appendChild(bgScaleRow);
+    bgScaleRow.append(bgScaleLabel, bgScaleRange, bgScaleValue);
+    bgBar.appendChild(bgScaleRow);
 
     // 首次使用没有模型时自动下载（检测 97MB + 姿态 219MB），页面顶部显示进度
     async function ensurePoseModel() {
@@ -1831,33 +1837,26 @@ export function createFloatingPanel(node, jsonWidget) {
     }
 
     const bgControlRow = document.createElement("div");
-    bgControlRow.style.cssText = "display: flex; align-items: center; gap: 6px; font-size: 12px;";
-    
-    const bgOpacityLabel = document.createElement("span");
-    bgOpacityLabel.textContent = "透明度";
-    bgOpacityLabel.style.color = "#aaa";
-    bgOpacityLabel.style.whiteSpace = "nowrap";
-    
+    bgControlRow.style.cssText = "display: flex; align-items: center; gap: 5px; flex: 0 0 auto;";
+
+    const bgOpacityLabel = mkBgLabel("不透明");
     const bgOpacitySlider = document.createElement("input");
     bgOpacitySlider.type = "range";
     bgOpacitySlider.min = "0";
     bgOpacitySlider.max = "1";
     bgOpacitySlider.step = "0.05";
     bgOpacitySlider.value = bgOpacity;
-    bgOpacitySlider.style.flex = "1";
+    bgOpacitySlider.style.width = "64px";
     bgOpacitySlider.oninput = (e) => { bgOpacity = parseFloat(e.target.value); drawCanvas(); };
-    
-    bgControlRow.appendChild(bgOpacityLabel);
-    bgControlRow.appendChild(bgOpacitySlider);
-    bgBody.appendChild(bgControlRow);
+
+    bgControlRow.append(bgOpacityLabel, bgOpacitySlider);
+    bgBar.appendChild(bgControlRow);
 
     // 🌟 背景图尺寸（没有背景图时禁用变灰）
     const bgSizeRow = document.createElement("div");
-    bgSizeRow.style.cssText = "display: flex; align-items: center; gap: 5px; font-size: 12px; min-width: 0;";
+    bgSizeRow.style.cssText = "display: flex; align-items: center; gap: 4px; flex: 0 0 auto;";
 
-    const bgSizeLabel = document.createElement("span");
-    bgSizeLabel.textContent = "尺寸";
-    bgSizeLabel.style.cssText = "color: #aaa; white-space: nowrap;";
+    const bgSizeLabel = mkBgLabel("尺寸");
 
     const mkSizeInput = (ph) => {
         const inp = document.createElement("input");
@@ -1866,9 +1865,7 @@ export function createFloatingPanel(node, jsonWidget) {
         inp.step = "1";
         inp.disabled = true;
         inp.placeholder = ph;
-        inp.style.cssText =
-            "flex: 1 1 0; min-width: 44px; background: #111; color: #eee; border: 1px solid #444; border-radius: 4px; " +
-            "padding: 2px 4px; text-align: center; outline: none; box-sizing: border-box; transition: opacity 0.12s;";
+        inp.className = "moss-mode-input";
         return inp;
     };
     const bgWInput = mkSizeInput("宽");
@@ -1877,38 +1874,21 @@ export function createFloatingPanel(node, jsonWidget) {
     bgSizeX.textContent = "×";
     bgSizeX.style.cssText = "color: #666;";
 
-    // 🌟 锁定长宽比
-    const bgLockBtn = document.createElement("button");
-    bgLockBtn.type = "button";
-    bgLockBtn.textContent = bgLockRatio ? "🔒" : "🔓";
-    bgLockBtn.title = bgLockRatio ? "已锁定长宽比（点按解锁）" : "未锁定长宽比（点按锁定）";
-    bgLockBtn.style.cssText =
-        "flex: 0 0 auto; width: 24px; height: 22px; line-height: 1; padding: 0; border-radius: 4px;" +
-        `background: #2a2a2a; border: 1px solid ${bgLockRatio ? "#4a9eff" : "#555"};` +
-        `color: ${bgLockRatio ? "#8ecbff" : "#ccc"}; font-size: 12px; cursor: pointer;`;
+    // 🌟 锁定长宽比：按钮亮 = 锁定
+    const bgLockBtn = mkBgBtn("锁定", "锁定长宽比：改一边另一边跟着变");
+    const syncLockBtn = () => {
+        bgLockBtn.classList.toggle("is-on", bgLockRatio);
+        bgLockBtn.title = bgLockRatio ? "已锁定长宽比（点按解锁）" : "未锁定长宽比（点按锁定）";
+    };
     bgLockBtn.onclick = () => {
         bgLockRatio = !bgLockRatio;
-        bgLockBtn.textContent = bgLockRatio ? "🔒" : "🔓";
-        bgLockBtn.title = bgLockRatio ? "已锁定长宽比（点按解锁）" : "未锁定长宽比（点按锁定）";
-        bgLockBtn.style.borderColor = bgLockRatio ? "#4a9eff" : "#555";
-        bgLockBtn.style.color = bgLockRatio ? "#8ecbff" : "#ccc";
+        syncLockBtn();
     };
+    syncLockBtn();
 
     // 🌟 铺满：按原图比例放大到盖住画布并居中
-    const bgCoverBtn = document.createElement("button");
-    bgCoverBtn.type = "button";
-    bgCoverBtn.textContent = "⤢ 铺满";
-    bgCoverBtn.title = "按原图比例放大到铺满画布并居中";
+    const bgCoverBtn = mkBgBtn("铺满", "按原图比例放大到铺满画布并居中");
     bgCoverBtn.disabled = true;
-    bgCoverBtn.style.cssText =
-        "background:#333;color:#ccc;border:1px solid #555;padding:2px 6px;border-radius:4px;" +
-        "cursor:pointer;font-size:11px;white-space:nowrap;transition:background 0.12s,opacity 0.12s;";
-    bgCoverBtn.onmouseover = () => {
-        if (!bgCoverBtn.disabled) bgCoverBtn.style.background = "#3f3f3f";
-    };
-    bgCoverBtn.onmouseout = () => {
-        bgCoverBtn.style.background = "#333";
-    };
     bgCoverBtn.onclick = () => {
         if (!bgImage) return;
         const { w, h } = getCanvasSize();
@@ -1921,24 +1901,15 @@ export function createFloatingPanel(node, jsonWidget) {
         drawCanvas();
     };
 
-    bgSizeRow.appendChild(bgSizeLabel);
-    bgSizeRow.appendChild(bgWInput);
-    bgSizeRow.appendChild(bgSizeX);
-    bgSizeRow.appendChild(bgHInput);
-    bgSizeRow.appendChild(bgLockBtn);
-    bgSizeRow.appendChild(bgCoverBtn);
-    bgBody.appendChild(bgSizeRow);
+    bgSizeRow.append(bgSizeLabel, bgWInput, bgSizeX, bgHInput, bgLockBtn, bgCoverBtn);
+    bgBar.appendChild(bgSizeRow);
 
     const syncBgSizeInputs = () => {
         const has = !!bgImage;
-        [bgWInput, bgHInput].forEach((inp) => {
-            inp.disabled = !has;
-            inp.style.opacity = has ? "1" : "0.45";
-            inp.style.cursor = has ? "text" : "not-allowed";
-        });
+        // 禁用态样式交给 .moss-mode-input:disabled，不再手写 opacity
+        bgWInput.disabled = !has;
+        bgHInput.disabled = !has;
         bgCoverBtn.disabled = !has;
-        bgCoverBtn.style.opacity = has ? "1" : "0.45";
-        bgCoverBtn.style.cursor = has ? "pointer" : "not-allowed";
         if (has) {
             // 正在输入时不要覆盖
             if (document.activeElement !== bgWInput) bgWInput.value = String(Math.round(bgW));
@@ -1973,27 +1944,36 @@ export function createFloatingPanel(node, jsonWidget) {
     syncBgSizeHook = syncBgSizeInputs;
     syncBgSizeInputs();
 
-    const bgActionRow = document.createElement("div");
-    bgActionRow.style.cssText = "display: flex; align-items: center; justify-content: space-between; margin-top: 2px;";
-    
-    const bgSnapLabel = document.createElement("label");
-    bgSnapLabel.style.cssText = "display: flex; align-items: center; gap: 4px; color: #ccc; font-size: 12px; cursor: pointer;";
-    bgSnapLabel.title = "勾选：拖动时按顶部的「对象吸附 / 网格吸附」设置自动对齐（按住 Alt 临时关闭）；取消：背景图自由拖动";
-    const bgSnapCb = document.createElement("input");
-    bgSnapCb.type = "checkbox";
-    bgSnapCb.checked = bgSnap;
-    bgSnapCb.style.cssText = "accent-color: #4a9eff; margin: 0;";
-    bgSnapCb.onchange = () => { bgSnap = bgSnapCb.checked; };
-    bgSnapLabel.appendChild(bgSnapCb);
-    bgSnapLabel.appendChild(document.createTextNode("吸附"));
+    const bgCropBtn = mkBgBtn("裁剪", "裁出背景图的可见区域（只影响显示）；按住 Alt 点击恢复整图");
+    bgCropBtn.onclick = (ev) => {
+        if (!bgImage) {
+            toast.show("还没有背景图", 1600);
+            return;
+        }
+        if (ev && ev.altKey) {
+            bgCrop = null;
+            bgCropMode = false;
+            bgCropOp = null;
+            bgCropBtn.classList.remove("is-on");
+            drawCanvas();
+            toast.show("已恢复整图", 1400);
+            return;
+        }
+        bgCropMode = !bgCropMode;
+        bgCropOp = null;
+        if (bgCropMode) {
+            if (!bgCrop) bgCrop = { x: 0, y: 0, w: 1, h: 1 };
+            toast.show("拖动橙色框调整背景图裁剪范围，Alt + 点「裁剪」恢复整图", 2400);
+        } else if (bgCrop
+            && Math.abs(bgCrop.x) < 1e-3 && Math.abs(bgCrop.y) < 1e-3
+            && Math.abs(bgCrop.w - 1) < 1e-3 && Math.abs(bgCrop.h - 1) < 1e-3) {
+            bgCrop = null;
+        }
+        bgCropBtn.classList.toggle("is-on", bgCropMode);
+        drawCanvas();
+    };
 
-    const bgBtnGroup = document.createElement("div");
-    bgBtnGroup.style.cssText = "display: flex; gap: 4px;";
-
-    const bgResetBtn = document.createElement("button");
-    bgResetBtn.textContent = "↺ 重置";
-    bgResetBtn.title = "恢复为导入时的初始尺寸与位置";
-    bgResetBtn.style.cssText = "background: #333; color: #ccc; border: 1px solid #555; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 11px;";
+    const bgResetBtn = mkBgBtn("重置", "恢复为导入时的初始尺寸与位置");
     bgResetBtn.onclick = () => {
         if (!bgImage || !bgInitialState) return;
         bgX = bgInitialState.x;
@@ -2004,31 +1984,16 @@ export function createFloatingPanel(node, jsonWidget) {
         drawCanvas();
     };
 
-    const bgCenterBtn = document.createElement("button");
-    bgCenterBtn.textContent = "🎯 居中";
-    bgCenterBtn.title = "将背景图中心对齐画布中心（不改变尺寸）";
-    bgCenterBtn.style.cssText = "background: #333; color: #ccc; border: 1px solid #555; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 11px;";
+    const bgCenterBtn = mkBgBtn("居中", "将背景图中心对齐画布中心（不改变尺寸）");
     bgCenterBtn.onclick = () => {
         if (bgImage) { bgX = 0; bgY = 0; drawCanvas(); }
     };
 
-    const bgDeleteBtn = document.createElement("button");
-    bgDeleteBtn.textContent = "✖ 移除";
-    bgDeleteBtn.title = "移除背景图";
-    // 🌟 这里改了样式：灰色次要按钮，避免和上方大红色的“删除边框”混淆
-    bgDeleteBtn.style.cssText =
-        "background: #2a2a2a; color: #aaa; border: 1px solid #444; padding: 2px 6px; border-radius: 4px; cursor: pointer; font-size: 11px;";
-    bgDeleteBtn.onmouseover = () => { bgDeleteBtn.style.background = "#3a2a2a"; bgDeleteBtn.style.color = "#ffaaaa"; bgDeleteBtn.style.borderColor = "#5a3a3a"; };
-    bgDeleteBtn.onmouseout = () => { bgDeleteBtn.style.background = "#2a2a2a"; bgDeleteBtn.style.color = "#aaa"; bgDeleteBtn.style.borderColor = "#444"; };
+    const bgDeleteBtn = mkBgBtn("移除", "移除背景图");
     bgDeleteBtn.onclick = () => deleteBackgroundImage();
 
-    bgBtnGroup.appendChild(bgResetBtn);
-    bgBtnGroup.appendChild(bgCenterBtn);
-    bgBtnGroup.appendChild(bgDeleteBtn);
-
-    bgActionRow.appendChild(bgSnapLabel);
-    bgActionRow.appendChild(bgBtnGroup);
-    bgBody.appendChild(bgActionRow);
+    bgBar.append(mkBgSep(), bgCropBtn, bgResetBtn, bgCenterBtn, bgDeleteBtn);
+    bgBar.appendChild(bgDetectHint); // 顺序调到末尾，提示出现时不打断工具条排列
 
     const listArea = document.createElement("div");
     // min-width: 0 让列表可以被父级压缩，而不是用内容宽度把右栏顶宽
@@ -2045,9 +2010,45 @@ export function createFloatingPanel(node, jsonWidget) {
         openPopover(canvasBtn, canvasPop, { width: 250 });
     });
 
-    const bgBtn = ribbon.button("image", "背景图设置", () => {
-        openPopover(bgBtn, bgPanel, { width: 268 });
+    // 🖼 背景图模式：点按钮直接进 / 出模式，不再有「操控」勾选框
+    const bgBtn = ribbon.button("image", "背景图模式：进入后拖动 / 拉伸背景图", () => {
+        const next = !bgActive;
+        setBgMode(next);
+        if (next) toast.show("背景图模式：拖动 / 拉伸背景图，点空白处不会建框；再点一次按钮退出", 2600);
     });
+
+    // 🖌 深度图编辑模式：白=近，黑=远（图标用四段灰阶，避免和背景图共用相框图标）
+    const syncDepthBtn = () => {
+        depthBtn.classList.toggle("is-active", !!depthEditor?.isActive());
+    };
+    const depthBtn = ribbon.button("depth", "深度图编辑（白=近，黑=远）", () => {
+        if (!depthEditor) return;
+        const on = !depthEditor.isActive();
+        depthEditor.setActive(on);
+        syncDepthBtn();
+        updateUndoButtonsRef?.();
+        if (on && bgActive) setBgMode(false); // 两种模式互斥，深度优先
+        if (on) toast.show("深度图模式：左键涂抹，1~5 换灰阶，再点一次按钮退出", 2600);
+        drawCanvas();
+    });
+
+    // 背景图模式开关：工具条显隐 + 按钮高亮，所有入口都走这里
+    function setBgMode(on) {
+        bgActive = !!on;
+        if (bgActive && depthEditor?.isActive()) {
+            depthEditor.setActive(false);
+            syncDepthBtn();
+            updateUndoButtonsRef?.();
+        }
+        syncBgMode();
+        drawCanvas();
+    }
+
+    syncBgMode = () => {
+        bgBar.classList.toggle("is-on", bgActive);
+        bgBtn.classList.toggle("is-active", bgActive);
+    };
+    syncBgMode();
 
     ribbon.group([selectAllBtn, addBtn, deleteBtn]);
 
@@ -2135,7 +2136,7 @@ export function createFloatingPanel(node, jsonWidget) {
 
     ribbon.group([...alignBtns, alignMoreBtn]);
     ribbon.group([snapModeSelect, gridSizeSelect]);
-    ribbon.group([canvasBtn, bgBtn]);
+    ribbon.group([canvasBtn, bgBtn, depthBtn]);
     ribbon.group([undoBtn, redoBtn, resetViewBtn]);
 
     // ================= 右栏：分辨率选择器（统一卡片组件，默认收起） =================
@@ -2816,6 +2817,54 @@ export function createFloatingPanel(node, jsonWidget) {
         return { x: centerX + model.view.x + lx * scale, y: centerY + model.view.y + ly * scale };
     };
 
+    // ================= 深度图编辑器 =================
+    // 选中框的逻辑矩形（bbox 是 [ymin, xmin, ymax, xmax]）
+    const getSelectedRect = () => {
+        const it = model.items?.[model.active];
+        if (!it || !Array.isArray(it.bbox)) return null;
+        const [y1, x1, y2, x2] = it.bbox;
+        return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+    };
+
+    depthEditor = createDepthEditor({
+        canvas,
+        getCanvasSize,
+        physToLogic,
+        logicToPhys,
+        toast,
+        getSelectedRect,
+        onChange: (dataUrl) => {
+            const w = node.widgets?.find((x) => x.name === "depth_png");
+            if (!w) return;
+            w.value = dataUrl;
+            node.graph?.setDirtyCanvas(true, true);
+        },
+        onRedraw: () => drawCanvas(),
+        onHistoryChange: () => updateUndoButtonsRef?.(),
+        // 图层吸附跟随顶部的「无 / 对象 / 网格」设置
+        getSnapMode: () => snapMode,
+        getGridSize: () => GRID_SNAP,
+        // 图层结构存 node.properties：跟着工作流保存，刷新浏览器还能还原成可编辑的图层
+        onState: (state) => {
+            node.properties = node.properties || {};
+            node.properties.moss_depth = state;
+        },
+    });
+    ribbon.el.after(depthEditor.el);
+
+
+    // 打开面板时把已保存的深度图读回来（延后到 drawCanvas 初始化之后）
+    setTimeout(() => {
+        const saved = node.properties?.moss_depth;
+        if (saved && (saved.layers?.length || saved.base)) {
+            depthEditor.restoreState(saved);
+            return;
+        }
+        // 没有图层结构（老工作流）就读合成图，退化成扁平笔刷层
+        const w = node.widgets?.find((x) => x.name === "depth_png");
+        if (w?.value) depthEditor.loadDataUrl(w.value);
+    }, 0);
+
     // ================= 吸附（无 / 对象 / 网格） =================
     const SNAP_PX = 6;
     let snapMode = "none";
@@ -2918,8 +2967,9 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // 按钮可用状态：栈底/栈顶时置灰
     const updateUndoButtons = () => {
-        const canUndo = model.canUndo();
-        const canRedo = model.canRedo();
+        const depthOn = !!depthEditor?.isActive();
+        const canUndo = depthOn ? depthEditor.canUndo() : model.canUndo();
+        const canRedo = depthOn ? depthEditor.canRedo() : model.canRedo();
         [[undoBtn, canUndo], [redoBtn, canRedo]].forEach(([btn, enabled]) => {
             if (!btn) return;
             btn.disabled = !enabled;
@@ -2927,6 +2977,7 @@ export function createFloatingPanel(node, jsonWidget) {
             btn.style.cursor = enabled ? "pointer" : "default";
         });
     };
+    updateUndoButtonsRef = updateUndoButtons;
 
     // 编辑器内部状态（极小框对齐 / 锁定）不进 JSON，靠 bbox + 序号跨重绘继承
     const carryEditorState = (prev, next) => {
@@ -2994,6 +3045,8 @@ export function createFloatingPanel(node, jsonWidget) {
             (t.tagName === "INPUT" && !["checkbox", "radio", "button", "range", "color"].includes((t.type || "text").toLowerCase()));
         if (isTextEditable || t.tagName === "SELECT") return;
         if (e.ctrlKey || e.metaKey || e.altKey) return;
+        // 深度模式下方向键不碰框，避免「画着画着框跑了」
+        if (depthEditor?.isActive()) return;
         if (model.active === -1 && model.selection.size === 0) return;
 
         const step = e.shiftKey ? GRID_SNAP : 1;
@@ -3236,26 +3289,83 @@ export function createFloatingPanel(node, jsonWidget) {
             ctx.globalAlpha = bgOpacity;
             const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
             const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
-            ctx.drawImage(bgImage, bp1.x, bp1.y, bp2.x - bp1.x, bp2.y - bp1.y);
 
-            // 如果开启背景图操控模式，画一个虚线框提示
+            // 裁剪只作用于图片本身：单独一层 save/clip/restore。
+            // 如果和虚线框共用一层，后面画的框和控制点也会被裁掉，裁剪后就看不见了。
+            if (bgCrop) {
+                const cr = bgCropRectPhys();
+                ctx.save();
+                ctx.beginPath();
+                ctx.rect(cr.x1, cr.y1, cr.x2 - cr.x1, cr.y2 - cr.y1);
+                ctx.clip();
+                ctx.drawImage(bgImage, bp1.x, bp1.y, bp2.x - bp1.x, bp2.y - bp1.y);
+                ctx.restore();
+            } else {
+                ctx.drawImage(bgImage, bp1.x, bp1.y, bp2.x - bp1.x, bp2.y - bp1.y);
+            }
+
+            // 1) 整张背景图的拖动虚线框 + 8 个控制点（蓝）
             if (bgActive) {
                 ctx.globalAlpha = 1;
-                ctx.strokeStyle = "#ff9800";
+                ctx.strokeStyle = "#4dabf7";
                 ctx.lineWidth = 2;
                 ctx.setLineDash([5, 5]);
                 ctx.strokeRect(bp1.x, bp1.y, bp2.x - bp1.x, bp2.y - bp1.y);
                 ctx.setLineDash([]);
 
-                // 画四角控制点
-                ctx.fillStyle = "#ff9800";
+                ctx.fillStyle = "#4dabf7";
                 const hs = HANDLE_SIZE;
-                [[bp1.x, bp1.y], [bp2.x, bp1.y], [bp1.x, bp2.y], [bp2.x, bp2.y]].forEach(([hx, hy]) => {
+                const bmx = (bp1.x + bp2.x) / 2;
+                const bmy = (bp1.y + bp2.y) / 2;
+                [
+                    [bp1.x, bp1.y], [bmx, bp1.y], [bp2.x, bp1.y],
+                    [bp1.x, bmy], [bp2.x, bmy],
+                    [bp1.x, bp2.y], [bmx, bp2.y], [bp2.x, bp2.y],
+                ].forEach(([hx, hy]) => {
                     ctx.fillRect(hx - hs / 2, hy - hs / 2, hs, hs);
                 });
             }
+
+            // 2) 裁剪框（橙）最后画：压暗 + 实线框 + 6×6 控制点。
+            //    样式和深度图层的裁剪保持一致，画在蓝色控制点之后才不会被盖住。
+            if (bgCropMode) {
+                const cr = bgCropRectPhys();
+                ctx.globalAlpha = 1;
+                ctx.save();
+                ctx.fillStyle = "rgba(0,0,0,.5)";
+                ctx.beginPath();
+                ctx.rect(bp1.x, bp1.y, bp2.x - bp1.x, bp2.y - bp1.y);
+                ctx.rect(cr.x1, cr.y1, cr.x2 - cr.x1, cr.y2 - cr.y1);
+                ctx.fill("evenodd");
+                ctx.strokeStyle = "#ffa94d";
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([]);
+                ctx.strokeRect(cr.x1, cr.y1, cr.x2 - cr.x1, cr.y2 - cr.y1);
+
+                ctx.fillStyle = "#ffa94d";
+                ctx.strokeStyle = "#2a1a06";
+                ctx.lineWidth = 1;
+                const mx = (cr.x1 + cr.x2) / 2;
+                const my = (cr.y1 + cr.y2) / 2;
+                for (const [hx, hy] of [
+                    [cr.x1, cr.y1], [mx, cr.y1], [cr.x2, cr.y1],
+                    [cr.x1, my], [cr.x2, my],
+                    [cr.x1, cr.y2], [mx, cr.y2], [cr.x2, cr.y2],
+                ]) {
+                    ctx.beginPath();
+                    ctx.rect(hx - 3, hy - 3, 6, 6);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+                ctx.restore();
+            }
+
             ctx.restore();
         }
+
+        // 🖌 深度图层（只在深度模式显示，画在底图之上、框之下）
+        depthEditor?.draw(ctx, logicToPhys);
+
         ctx.strokeStyle = "#333";
         ctx.lineWidth = 1;
         ctx.strokeRect(p1.x + 0.5, p1.y + 0.5, canvasW_phys - 1, canvasH_phys - 1);
@@ -3561,15 +3671,25 @@ export function createFloatingPanel(node, jsonWidget) {
         if (document.activeElement !== canvas) return;
         const items = e.clipboardData?.items;
         if (!items) return;
+        // 当前在深度模式 → 粘贴的是深度图；否则按老行为当背景图
+        const depthMode = !!depthEditor?.isActive();
         for (const item of items) {
-            if (item.type && item.type.startsWith("image/")) {
-                const blob = item.getAsFile();
-                if (blob && loadBackgroundFromBlob(blob)) {
-                    toast.show("已粘贴背景图");
-                    e.preventDefault();
-                    e.stopPropagation(); // 防止 ComfyUI 全局粘贴节点/图片
-                    return;
-                }
+            if (!item.type || !item.type.startsWith("image/")) continue;
+            const blob = item.getAsFile();
+            if (!blob) continue;
+            if (depthMode) {
+                depthEditor.importBlob(blob).then((ok) => {
+                    if (ok) toast.show("已粘贴深度图（白=近，黑=远）", 2000);
+                });
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
+            if (loadBackgroundFromBlob(blob)) {
+                toast.show("已粘贴背景图");
+                e.preventDefault();
+                e.stopPropagation(); // 防止 ComfyUI 全局粘贴节点/图片
+                return;
             }
         }
     });
@@ -3608,29 +3728,19 @@ export function createFloatingPanel(node, jsonWidget) {
         const bp1 = logicToPhys(bgX - bgW / 2, bgY - bgH / 2);
         const bp2 = logicToPhys(bgX + bgW / 2, bgY + bgH / 2);
         // 拉伸点可能在画布外的黑色区域，容差放宽一点
-        const handleDist = 18;
-
-        const nearTL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
-        const nearTR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp1.y) < handleDist;
-        const nearBL = Math.abs(mouseX - bp1.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
-        const nearBR = Math.abs(mouseX - bp2.x) < handleDist && Math.abs(mouseY - bp2.y) < handleDist;
-
-        const nearT = !nearTL && !nearTR && mouseY > bp1.y - handleDist && mouseY < bp1.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
-        const nearB = !nearBL && !nearBR && mouseY > bp2.y - handleDist && mouseY < bp2.y + handleDist && mouseX > bp1.x && mouseX < bp2.x;
-        const nearL = !nearTL && !nearBL && mouseX > bp1.x - handleDist && mouseX < bp1.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
-        const nearR = !nearTR && !nearBR && mouseX > bp2.x - handleDist && mouseX < bp2.x + handleDist && mouseY > bp1.y && mouseY < bp2.y;
-
-        if (nearTL) return "tl";
-        if (nearTR) return "tr";
-        if (nearBL) return "bl";
-        if (nearBR) return "br";
-        if (nearT) return "t";
-        if (nearB) return "b";
-        if (nearL) return "l";
-        if (nearR) return "r";
-        if (mouseX > bp1.x && mouseX < bp2.x && mouseY > bp1.y && mouseY < bp2.y) return "move";
-        return null;
+        return hitRect(bp1.x, bp1.y, bp2.x, bp2.y, mouseX, mouseY, 18);
     };
+
+    // 裁剪框在屏幕上的矩形（物理像素）
+    // 用函数声明：drawCanvas 在更早的位置就会调用它，const 会踩 TDZ
+    function bgCropRectPhys() {
+        const c = bgCrop || { x: 0, y: 0, w: 1, h: 1 };
+        const left = bgX - bgW / 2 + c.x * bgW;
+        const top = bgY - bgH / 2 + c.y * bgH;
+        const p1 = logicToPhys(left, top);
+        const p2 = logicToPhys(left + c.w * bgW, top + c.h * bgH);
+        return { x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y };
+    }
 
     // 框选结算：矩形与框的视觉范围相交即选中；矩形太小当成在空白处点了一下
     const applyMarqueeSelection = (rect, additive) => {
@@ -3750,6 +3860,30 @@ export function createFloatingPanel(node, jsonWidget) {
         }
 
         if (e.button !== 0) return;
+
+        // 🖌 深度模式：左键涂抹，拦截所有框选逻辑
+        if (depthEditor?.isActive()) {
+            if (depthEditor.pointerDown(e, mouseX, mouseY)) {
+                e.preventDefault();
+                return;
+            }
+        }
+
+        // 🌟 背景图裁剪模式：优先级高于拖动 / 拉伸
+        if (bgCropMode && bgImage) {
+            const cr = bgCropRectPhys();
+            const mode = hitRect(cr.x1, cr.y1, cr.x2, cr.y2, mouseX, mouseY, 14);
+            if (mode) {
+                bgCropOp = {
+                    mode,
+                    startX: mouseX,
+                    startY: mouseY,
+                    rect: bgCrop ? { ...bgCrop } : { x: 0, y: 0, w: 1, h: 1 },
+                };
+            }
+            e.preventDefault();
+            return;
+        }
 
         // 🌟 背景图操控拦截
         if (bgActive && bgImage) {
@@ -3938,6 +4072,36 @@ export function createFloatingPanel(node, jsonWidget) {
             return;
         }
 
+        // 🌟 背景图裁剪拖拽
+        if (bgCropOp && bgImage) {
+            const scale = Math.max(0.0001, getActualScale());
+            const dx = (mouseX - bgCropOp.startX) / scale / Math.max(1, bgW);
+            const dy = (mouseY - bgCropOp.startY) / scale / Math.max(1, bgH);
+            const r = bgCropOp.rect;
+            const minW = 8 / Math.max(1, bgW);
+            const minH = 8 / Math.max(1, bgH);
+            let x1 = r.x;
+            let y1 = r.y;
+            let x2 = r.x + r.w;
+            let y2 = r.y + r.h;
+
+            if (bgCropOp.mode === "move") {
+                x1 = Math.min(1 - r.w, Math.max(0, r.x + dx));
+                y1 = Math.min(1 - r.h, Math.max(0, r.y + dy));
+                x2 = x1 + r.w;
+                y2 = y1 + r.h;
+            } else {
+                if (bgCropOp.mode.includes("l")) x1 = Math.min(x2 - minW, Math.max(0, r.x + dx));
+                if (bgCropOp.mode.includes("r")) x2 = Math.max(x1 + minW, Math.min(1, r.x + r.w + dx));
+                if (bgCropOp.mode.includes("t")) y1 = Math.min(y2 - minH, Math.max(0, r.y + dy));
+                if (bgCropOp.mode.includes("b")) y2 = Math.max(y1 + minH, Math.min(1, r.y + r.h + dy));
+            }
+
+            bgCrop = { x: x1, y: y1, w: Math.max(minW, x2 - x1), h: Math.max(minH, y2 - y1) };
+            drawCanvas();
+            return;
+        }
+
         // 🌟 背景图拖拽计算
         if (bgDragMode && bgImage) {
             const dx = (mouseX - bgStartMouse.x) / getActualScale();
@@ -3946,7 +4110,8 @@ export function createFloatingPanel(node, jsonWidget) {
             let nx = bgStartBBox.x, ny = bgStartBBox.y, nw = bgStartBBox.w, nh = bgStartBBox.h;
             bgSnapGuides = [];
 
-            const canSnap = bgSnap && !e.altKey && snapMode !== "none";
+            // 吸附完全由顶部「无吸附 / 对象吸附 / 网格吸附」决定，Alt 临时关闭
+            const canSnap = !e.altKey && snapMode !== "none";
             const snapLines = canSnap && snapMode === "object" ? bgSnapLines() : null;
 
             if (bgDragMode === "move") {
@@ -4254,6 +4419,12 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     window.addEventListener("mouseup", () => {
+        depthEditor?.pointerUp();
+        if (bgCropOp) {
+            bgCropOp = null;
+            drawCanvas();
+            return;
+        }
         if (bgDragMode) {
             bgDragMode = null;
             bgSnapGuides = [];
@@ -4680,6 +4851,7 @@ export function createFloatingPanel(node, jsonWidget) {
         }
         if (!isPanelOpen() || isTypingElsewhere()) return;
         if (!isOurContext(e.target)) return;
+        if (depthEditor?.isActive()) return; // 深度模式下不复制框
 
         if (copySelectedBoxes()) {
             toast.show(`已复制 ${bboxClipboard.length} 个框`);
@@ -4739,6 +4911,8 @@ export function createFloatingPanel(node, jsonWidget) {
         // Delete / Backspace：焦点在画布、列表行、全选按钮上都生效；
         // 输入框 / 下拉框里由 isTypingElsewhere 挡住，不会误删
         if ((key === "delete" || key === "backspace") && !isCtrl && !e.altKey) {
+            // 深度模式下 Delete 只该影响深度图，绝不能把背景图或选中的框删掉
+            if (depthEditor?.isActive()) return;
             if (!deleteSelectionOrBackground()) return;
             e.preventDefault();
             e.stopPropagation();
@@ -4890,15 +5064,23 @@ export function createFloatingPanel(node, jsonWidget) {
         const mouseX = e.clientX - rect.left;
         const mouseY = e.clientY - rect.top;
 
+        if (depthEditor?.isActive()) {
+            depthEditor.pointerMove(e, mouseX, mouseY);
+            return;
+        }
+
+        // 🌟 背景图裁剪模式：光标跟着裁剪框的控制点走，优先于整体拖动
+        if (bgCropMode && bgImage) {
+            const cr = bgCropRectPhys();
+            const mode = hitRect(cr.x1, cr.y1, cr.x2, cr.y2, mouseX, mouseY, 14);
+            canvas.style.cursor = cursorForHit(mode, "default");
+            return;
+        }
+
         // 🌟 最高优先级：操控背景图时的光标（移动 / 拉伸），优先于框和黑色区域
         if (bgActive && bgImage) {
-            const mode = getBgHitMode(mouseX, mouseY);
-            if (mode === "tl" || mode === "br") canvas.style.cursor = "nwse-resize";
-            else if (mode === "tr" || mode === "bl") canvas.style.cursor = "nesw-resize";
-            else if (mode === "t" || mode === "b") canvas.style.cursor = "ns-resize";
-            else if (mode === "l" || mode === "r") canvas.style.cursor = "ew-resize";
-            else if (mode === "move") canvas.style.cursor = "move";
-            else canvas.style.cursor = "default"; // 操控模式下空白处不建框、不平移
+            // 操控模式下空白处不建框、不平移
+            canvas.style.cursor = cursorForHit(getBgHitMode(mouseX, mouseY), "default");
             return;
         }
 
@@ -4944,7 +5126,8 @@ export function createFloatingPanel(node, jsonWidget) {
     });
 
     canvas.addEventListener("mouseleave", () => {
-        if (!isPanning && !dragMode) canvas.style.cursor = "default";
+        depthEditor?.pointerLeave();
+        if (!isPanning && !dragMode && !depthEditor?.isActive()) canvas.style.cursor = "default";
     });
 
     const updateListSelection = () => {
@@ -5770,7 +5953,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 <li>拖动框的四个角：<b>拉伸缩放</b></li>
                 <li>双击框内部：<b>快速编辑描述</b></li>
                 <li>滚轮：<b>缩放画布</b>；中键拖动：<b>平移画布</b></li>
-                <li>开启「背景图设置 → 操控」后：拖动 / 拉伸背景图，靠近画布边缘或中心会<b>吸附并显示蓝色虚线</b></li>
+                <li>点工具条的<b>背景图按钮</b>进入背景图模式（按钮变蓝，下方出现背景图工具条）：拖动 / 拉伸背景图，靠近画布边缘或中心会<b>吸附并显示蓝色虚线</b>；再点一次退出</li>
             </ul>
 
             <div style="margin-bottom: 10px;"><b style="color:#fff;">⌨️ 快捷键：</b></div>
@@ -5782,7 +5965,7 @@ export function createFloatingPanel(node, jsonWidget) {
                 <li><b>Ctrl + C / Ctrl + V</b>：复制框到系统剪贴板 / 粘贴框或背景图</li>
                 <li><b>Delete / Backspace</b>：删除选中框（或在操控模式下删除背景图）</li>
                 <li><b>方向键</b>：微移选中的框 1px；<b>Shift + 方向键</b>：按吸附步长移动</li>
-                <li><b>撤销 / 重做 / 重置视图</b>：画布右下角的 ↶ ↷ 🎯 按钮</li>
+                <li><b>撤销 / 重做 / 重置视图</b>：顶部工具条右侧那组 ↶ ↷ 🎯；进入深度模式后，↶ ↷ 作用于深度图自己的操作栈（只共按钮，不共状态），<b>Shift + 点击</b>可强制撤回画布，退出深度模式后恢复原语义</li>
                 <li><b>Ctrl + 点击</b>：增减多选框</li>
                 <li><b>按住 Alt / Ctrl / Shift</b>：画布顶部显示这一组快捷键提示；每次操作后也会短暂显示结果</li>
                 <li><b>框色右侧「提示词预设」</b>：点标签选中（可多选），点「写入」追加到描述；按住 Shift 点「写入」覆盖描述。「方向」的起点 + 终点会拼成一段（从左到右），中间不加逗号；红色标题的类型自动带上「类型名：」前缀，选中后按住 Alt 点标签可切换带不带；自建类型的标题双击改名，单击后点右侧 × 或直接右键标题可删除</li>
@@ -5819,7 +6002,44 @@ export function createFloatingPanel(node, jsonWidget) {
         renderList();
     };
 
+    // 🌟 面板与 onExecuted 的桥。放在函数末尾：drawCanvas 是 3217 行的 const，
+    // 提前赋值的话，只要构建中途出过一次异常，闭包里就是 TDZ，后面每次执行都会报错。
+    node._mossPanelUpdate = ({ image, clear } = {}) => {
+        if (clear) {
+            if (bgSource === "auto") deleteBackgroundImage();
+        } else if (image) {
+            applyBackgroundImage(image, "auto");
+        } else {
+            safeRedraw();
+        }
+    };
+
+    // 🌟 节点 depth_image 输入执行后回传的图：当图层注入（同 key 只加一次）
+    node._mossPanelDepth = ({ img, key } = {}) => {
+        if (!img) return;
+        const added = depthEditor.importImage(img, key);
+        if (added) {
+            // 不在深度模式时 draw() 会直接 return，注入后自动切过去
+            if (!depthEditor.isActive()) depthEditor.setActive(true);
+            syncDepthBtn();
+            toast.show("已把节点输入的深度图作为图层导入", 2200);
+        }
+        safeRedraw();
+    };
+
     openPanelIds.add(node.id); // 记下来，节点被重建（如 Ctrl+Z）时可自动恢复
+
+    // 🌟 消费 pending 深度图（面板打开前就执行过的那张）
+    if (node._mossPendingDepth) {
+        try {
+            if (node._mossPendingDepth.img) {
+                depthEditor?.importImage(node._mossPendingDepth.img, node._mossPendingDepth.key);
+            }
+        } catch (e) {
+            console.error("[MOSS] 消费 pending 深度图失败:", e);
+        }
+        node._mossPendingDepth = null;
+    }
 
     // 🌟 消费 pending 背景图（放在函数末尾，此时 getCanvasSize / drawCanvas 等全部已初始化）
     if (node._mossPendingBackground) {

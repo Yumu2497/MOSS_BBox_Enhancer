@@ -16,6 +16,9 @@ const ICONS = {
     magnet: '<path d="M3.5 3.5v4a4.5 4.5 0 0 0 9 0v-4"/><path d="M3.5 3.5h3.2M13.3 3.5h-3.2"/>',
     canvas: '<rect x="3" y="3" width="10" height="10" rx="1"/><path d="M2 5V3.5A1.5 1.5 0 0 1 3.5 2H5M11 2h1.5A1.5 1.5 0 0 1 14 3.5V5M14 11v1.5a1.5 1.5 0 0 1-1.5 1.5H11M5 14H3.5A1.5 1.5 0 0 1 2 12.5V11"/>',
     image: '<rect x="2" y="3" width="12" height="10" rx="1"/><circle cx="5.5" cy="6.5" r="1.1"/><path d="M2.5 11.2l3.3-2.8 2.8 2.3 1.9-1.5 2.8 2.3"/>',
+    // 深度图：四段灰阶 + 外框。填充用内联 style 盖掉 svg 上继承的 fill:none，
+    // 最暗那格 (#4a5057) 比面板底 #1e1e1e 亮两档，14px 下也不会糊成暗块。
+    depth: '<rect x="2" y="3.5" width="3" height="9" style="fill:#e6e9ec;stroke:none"/><rect x="5" y="3.5" width="3" height="9" style="fill:#a8aeb5;stroke:none"/><rect x="8" y="3.5" width="3" height="9" style="fill:#6d737a;stroke:none"/><rect x="11" y="3.5" width="3" height="9" style="fill:#4a5057;stroke:none"/><rect x="2" y="3.5" width="12" height="9" rx="1"/>',
     undo: '<path d="M5.5 5.5H9a3.6 3.6 0 0 1 0 7.2H6"/><path d="M7.6 3.2L5 5.5l2.6 2.3"/>',
     redo: '<path d="M10.5 5.5H7a3.6 3.6 0 0 0 0 7.2h3"/><path d="M8.4 3.2L11 5.5 8.4 7.8"/>',
     reset: '<circle cx="8" cy="8" r="4.2"/><path d="M8 1.6v2M8 12.4v2M1.6 8h2M12.4 8h2"/>',

@@ -3,7 +3,11 @@ import nodes
 import io
 import os
 import base64
+import hashlib
 import time
+
+import numpy as np
+import torch
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 from aiohttp import web
 from server import PromptServer
@@ -264,6 +268,26 @@ def _tensor_to_pil(image):
     return Image.fromarray(array)
 
 
+def _save_temp_image(pil_img, prefix):
+    """把 PIL 图存进 temp 目录并返回 ComfyUI 的 ui 图片描述。
+
+    文件名带内容哈希：内容没变就是同一个文件（前端据此去重，不会重复导入图层），
+    上游换了图哈希就变，前端会当成新图层。
+    """
+    try:
+        buf = io.BytesIO()
+        pil_img.save(buf, format="PNG")
+        digest = hashlib.md5(buf.getvalue()).hexdigest()[:10]
+        filename = f"{prefix}_{digest}.png"
+        path = os.path.join(folder_paths.get_temp_directory(), filename)
+        if not os.path.exists(path):
+            pil_img.save(path, compress_level=1)
+        return {"filename": filename, "subfolder": "", "type": "temp"}
+    except Exception as exc:
+        print(f"[MOSS Import] 暂存图片失败: {exc}")
+        return None
+
+
 def render_layout_preview(items, colors, width, height, background=None):
     """按画布尺寸画一张布局预览：每个框的描边取各自颜色，左上角标序号。"""
     width = max(1, int(width))
@@ -309,6 +333,76 @@ def render_layout_preview(items, colors, width, height, background=None):
     return img
 
 
+def _depth_tensor(png_data, width, height):
+    """把面板写入的 base64 PNG 转成 IMAGE 张量（灰度复制成三通道）。
+
+    没画过深度时输出中灰 0.5——代表"中景/未指定"，避免整张全黑被
+    下游 Depth ControlNet 当成"全部极远"。
+    """
+    img = None
+    if isinstance(png_data, str) and "," in png_data:
+        try:
+            raw = base64.b64decode(png_data.split(",", 1)[1])
+            img = Image.open(io.BytesIO(raw)).convert("L")
+        except Exception as exc:
+            print(f"[MOSS Import] 深度图解码失败，回退中灰: {exc}")
+            img = None
+
+    if img is None:
+        arr = np.full((height, width), 128, dtype=np.float32) / 255.0
+    else:
+        if img.size != (width, height):
+            img = img.resize((width, height), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32) / 255.0
+
+    arr = np.repeat(arr[:, :, None], 3, axis=2)
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _fit_depth_image(image, width, height):
+    """把外部接进来的 IMAGE 对齐成画布尺寸的灰度图（三通道同值）。
+
+    只做「灰度化 + 缩放到画布」，不改数值方向：约定仍是白=近、黑=远。
+    多张时只用第一张；形状不认识就返回 None，让调用方回退到中灰。
+    """
+    if image is None:
+        return None
+    try:
+        t = image[:1]
+        if t.ndim != 4:
+            return None
+        if t.shape[-1] >= 3:
+            t = t[..., :3]
+            # Rec.709 亮度，比 0.299/0.587/0.114 更接近人眼感知
+            t = t[..., 0:1] * 0.2126 + t[..., 1:2] * 0.7152 + t[..., 2:3] * 0.0722
+        else:
+            t = t[..., :1]
+        t = t.permute(0, 3, 1, 2)
+        if t.shape[-2] != height or t.shape[-1] != width:
+            t = torch.nn.functional.interpolate(
+                t, size=(height, width), mode="bilinear", align_corners=False
+            )
+        t = t.permute(0, 2, 3, 1).clamp(0.0, 1.0)
+        return t.repeat(1, 1, 1, 3)
+    except Exception as exc:
+        print(f"[MOSS Import] 深度图输入处理失败，回退中灰: {exc}")
+        return None
+
+
+def _resolve_depth(depth_image, depth_png, width, height):
+    """深度图取值顺序：面板里的内容 → 节点接的 IMAGE → 中灰 0.5。
+
+    面板优先是有意的：外部输入会被注入面板当成一个图层，用户在面板里挪过位置之后，
+    合成的 depth_png 才是他真正想要的；只用外部原图会让拖动看起来「没生效」。
+    """
+    if isinstance(depth_png, str) and depth_png.strip():
+        return _depth_tensor(depth_png, width, height)
+    out = _fit_depth_image(depth_image, width, height)
+    if out is None:
+        out = _depth_tensor("", width, height)
+    return out
+
+
 class MOSS_JSON_Importer:
     @classmethod
     def INPUT_TYPES(cls):
@@ -325,22 +419,27 @@ class MOSS_JSON_Importer:
                                            "tooltip": "面板自动写入：{序号: 颜色}，只用于「边界框」输出，不进入 layout_json。"}),
                 "preview": ("BOOLEAN", {"default": True,
                                         "tooltip": "运行后在节点下方预览画布（框 + 序号）。关掉则不生成图片。"}),
+                "depth_png": ("STRING", {"default": "", "multiline": False,
+                                         "tooltip": "面板自动写入：深度图的 base64 PNG（白=近，黑=远），只用于「深度图」输出。"}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "可选图片：用作画布尺寸参考和面板背景图。"}),
+                "depth_image": ("IMAGE", {"tooltip": "可选深度图（白=近，黑=远）：接上就用它作为「深度图」输出，按画布尺寸自动缩放并灰度化；不接则用面板里手绘的深度图。"}),
             },
         }
     
     OUTPUT_NODE = True
-    RETURN_TYPES = ("ARRAY", "STRING", "STRING", "ARRAY", "INT", "INT")
-    RETURN_NAMES = ("元素数组", "主提示词", "完整提示词", "边界框", "画布宽度", "画布高度")
+    RETURN_TYPES = ("ARRAY", "STRING", "STRING", "ARRAY", "INT", "INT", "IMAGE")
+    RETURN_NAMES = ("元素数组", "主提示词", "完整提示词", "边界框", "画布宽度", "画布高度", "深度图")
     FUNCTION = "execute"
     CATEGORY = "MOSS_BBox_Enhancer"
 
     def execute(self, layout_json, canvas_width, canvas_height,
-                use_image_size=True, image=None, bbox_colors="", preview=True):
+                use_image_size=True, image=None, bbox_colors="", preview=True,
+                depth_png="", depth_image=None):
         ui = {}
         print(f"[MOSS Import] 进入: image={'None' if image is None else f'tensor{tuple(image.shape)}'}, "
+          f"depth_image={'None' if depth_image is None else f'tensor{tuple(depth_image.shape)}'}, "
           f"use_image_size={use_image_size}, widget尺寸={canvas_width}x{canvas_height}")
 
         # 🌟 核心修复：无论有没有图，都把后端当前实际使用的尺寸回传给前端！
@@ -368,9 +467,22 @@ class MOSS_JSON_Importer:
             except Exception as e:
                 print(f"[MOSS Import] 读取图片尺寸失败: {e}")
 
+        # 外部接进来的深度图：存成临时文件回传前端，让面板把它当图层加载进来
+        if depth_image is not None:
+            try:
+                info = _save_temp_image(_tensor_to_pil(depth_image[:1]), "moss_depth_in")
+                if info:
+                    ui["depth_images"] = [info]
+                    print(f"[MOSS Import] 深度图输入已回传前端: {info['filename']}")
+            except Exception as e:
+                print(f"[MOSS Import] 深度图输入暂存失败: {e}")
+
         # 提前返回时，也要保证返回 4 个值
         if not layout_json.strip():
-            return {"ui": ui, "result": ([], "", "", [], canvas_width, canvas_height)}
+            return {"ui": ui, "result": (
+                [], "", "", [], canvas_width, canvas_height,
+                _resolve_depth(depth_image, depth_png, canvas_width, canvas_height),
+            )}
 
         try:
             data = json.loads(layout_json)
@@ -379,7 +491,10 @@ class MOSS_JSON_Importer:
             print(f"[MOSS Import] JSON 解析失败，按纯文本处理: {e}")
             prompt = layout_json.strip()
             # 因为没有画框，元素数组和边界框都为空，主提示词和完整提示词都是这段纯文本
-            return {"ui": ui, "result": ([], prompt, prompt, [], canvas_width, canvas_height)}
+            return {"ui": ui, "result": (
+                [], prompt, prompt, [], canvas_width, canvas_height,
+                _resolve_depth(depth_image, depth_png, canvas_width, canvas_height),
+            )}
 
         # 草稿格式（abs/xyxy）自动转成模型格式（abs_centralized/yxyx）
         data, draft_w, draft_h = normalize_layout(data, canvas_width, canvas_height)
@@ -501,8 +616,12 @@ class MOSS_JSON_Importer:
 
         print(f"[MOSS Import] 成功导入 {len(elements)} 个框，主提示词: {len(prompt)} 字符，完整提示词模式: {'JSON' if elements else '纯文本'}")
         
-        # 返回：元素数组、主提示词、完整提示词、边界框（带颜色）
-        return {"ui": ui, "result": (elements, prompt, full_prompt, colored_boxes, canvas_width, canvas_height)}
+        # 深度图：节点上接的 IMAGE 优先，否则用面板手绘的（白=近/黑=远）
+        depth_out = _resolve_depth(depth_image, depth_png, canvas_width, canvas_height)
+
+        # 返回：元素数组、主提示词、完整提示词、边界框（带颜色）、画布宽高、深度图
+        return {"ui": ui, "result": (elements, prompt, full_prompt, colored_boxes,
+                                     canvas_width, canvas_height, depth_out)}
 
 
 NODE_CLASS_MAPPINGS = {"MOSS_JSON_Importer": MOSS_JSON_Importer}
