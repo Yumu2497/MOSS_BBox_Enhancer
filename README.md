@@ -338,6 +338,18 @@ MOSS JSON 使用以画布中心为原点的像素坐标，BBox 顺序为：
 
 ## 安装
 
+### 通过 ComfyUI Manager（推荐）
+
+在 Manager 里搜 `MOSS BBox`，或直接装：
+
+```bash
+comfy node install moss-bbox-enhancer
+```
+
+装完重启 ComfyUI。
+
+### 手动安装
+
 将插件目录放入：
 
 ```text
@@ -345,6 +357,16 @@ ComfyUI/custom_nodes/MOSS_BBox_Enhancer
 ```
 
 重启 ComfyUI 后即可使用。
+
+### 可选依赖（只影响「识别人体部位」）
+
+核心节点不引入任何新依赖（`numpy` / `Pillow` ComfyUI 自带）。**人体部位识别**额外需要 `opencv-python` 和 `onnxruntime`：
+
+```bash
+pip install opencv-python onnxruntime
+```
+
+没有硬塞进主依赖，是因为 `onnxruntime` 与 `onnxruntime-gpu` 会互相覆盖，强制安装容易把已经配好 GPU 版的环境搞坏。
 
 ### 示例工作流
 
@@ -363,4 +385,15 @@ ComfyUI/custom_nodes/MOSS_BBox_Enhancer
 
 本插件不新增第三方依赖。
 
-版本号只在 `MOSS_Version.py` 的 `__version__` 维护一处，布局编辑器标题栏右侧的版本胶囊通过 `GET /moss/version` 读取，前端不再单独存一份。节点左下角那颗 `MOSS_BBox_Enhancer` 徽标来自 ComfyUI 前端注册的包名，不受版本号影响，插件侧没有可改的字段。
+节点运行时的版本号只在 `MOSS_Version.py` 的 `__version__` 一处（Registry 侧另有一份在 `pyproject.toml`，见下节），布局编辑器标题栏右侧的版本胶囊通过 `GET /moss/version` 读取，前端不再单独存一份。节点左下角那颗 `MOSS_BBox_Enhancer` 徽标来自 ComfyUI 前端注册的包名，不受版本号影响，插件侧没有可改的字段。
+
+### 发布到 Comfy Registry（维护者）
+
+Registry 从 `pyproject.toml` 读版本号，节点标题栏读 `MOSS_Version.py`，所以**发版要同时改两处**：
+
+1. `pyproject.toml` → `[project] version`
+2. `MOSS_Version.py` → `__version__`
+
+推到 `main` 后 `.github/workflows/publish.yml` 会自动跑到 Registry。workflow 里有一道版本一致性检查，两处不一致会直接失败并提示，不会发出「页面写 1.7.0、插件里显示 1.6.x」的版本。
+
+需要在仓库 Settings → Secrets and variables → Actions 里配 `REGISTRY_ACCESS_TOKEN`，值是 registry.comfy.org 上 `yumu2497` 这个 publisher 的 API Key。

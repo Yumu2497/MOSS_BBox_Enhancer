@@ -1,0 +1,31 @@
+[project]
+name = "moss-bbox-enhancer"
+description = "MOSS 布局 JSON 导入与可视化边界框编辑：面板手绘深度图/深度图层、背景图裁剪、DWPose 人体部位识别、尺寸映射与按框色绘制。"
+version = "1.7.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+# ComfyUI 本身自带 numpy / Pillow，这里只是把依赖写明确，Manager 会跳过已装的
+dependencies = [
+    "numpy",
+    "Pillow",
+]
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[project.optional-dependencies]
+# 「识别人体部位」才需要这两个（推理走 onnxruntime，图像变换走 cv2）。
+# 不放进主依赖：onnxruntime 与 onnxruntime-gpu 会互相覆盖，强制安装容易把已经有 GPU 版的环境搞坏。
+pose = [
+    "opencv-python",
+    "onnxruntime",
+]
+
+[project.urls]
+Repository = "https://github.com/Yumu2497/MOSS_BBox_Enhancer"
+"Bug Tracker" = "https://github.com/Yumu2497/MOSS_BBox_Enhancer/issues"
+
+[tool.comfy]
+PublisherId = "yumu2497"
+DisplayName = "MOSS BBox Enhancer"
