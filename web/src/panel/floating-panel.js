@@ -52,6 +52,8 @@ export function createFloatingPanel(node, jsonWidget) {
     let bgInitialState = null;
     let bgSource = "none"; // 'manual' | 'auto'
     // 背景图层属性（右侧栏那一行用）
+    // model 是 createEditorModel() 在面板中段才创建的，早期刷新角标要等它就绪
+    let modelReady = false;
     let bgName = "背景图";
     let bgVisible = true;
     let bgLocked = false;
@@ -2079,6 +2081,7 @@ export function createFloatingPanel(node, jsonWidget) {
         });
     }
     function updateTabLabels() {
+        if (!modelReady) return;
         tabBtns.box.textContent = `框 ${model.items.length}`;
         tabBtns.bg.textContent = `背景 ${bgImage ? 1 : 0}`;
         tabBtns.depth.textContent = `深度 ${depthEditor ? depthEditor.layerCount() : 0}`;
@@ -2332,8 +2335,13 @@ export function createFloatingPanel(node, jsonWidget) {
                 hW.value = height;
                 hW.callback?.(height);
             }
-            // drawCanvas 定义在后面，初始化那次 apply 用下一帧兜住
-            setTimeout(() => drawCanvas(), 0);
+            // drawCanvas 定义在后面，初始化那次 apply 用下一帧兜住；
+            // 万一面板构建中途抛异常，这个定时器也要安静退出，不能再炸一个 TDZ
+            setTimeout(() => {
+                try {
+                    drawCanvas();
+                } catch (_) { /* 面板还没建完 */ }
+            }, 0);
         },
         flat: true,
     });
@@ -2934,6 +2942,8 @@ export function createFloatingPanel(node, jsonWidget) {
 
     // --- 核心状态与变量 ---
     const model = createEditorModel();
+    modelReady = true;
+    updateTabLabels();
     let isUpdatingFromUI = false;
     updateAlignState();
 
