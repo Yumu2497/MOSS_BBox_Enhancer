@@ -105,8 +105,11 @@ export function createFloatingPanel(node, jsonWidget) {
         bgX = 0;
         bgY = 0;
         bgInitialState = { x: bgX, y: bgY, w: bgW, h: bgH };
-        // 手动导入即进入背景图模式，省掉再去点一次按钮
-        if (source === "manual") bgActive = true;
+        // 手动导入即进入背景图模式，省掉再去点一次按钮；顺手把深度模式关掉
+        if (source === "manual") {
+            bgActive = true;
+            leaveDepthMode();
+        }
         syncBgMode?.();
         if (syncBgSizeHook) syncBgSizeHook();
         safeRedraw();
@@ -124,6 +127,15 @@ export function createFloatingPanel(node, jsonWidget) {
         }
     }
 
+
+    // 两种模式互斥：进背景图模式就退出深度模式。
+    // 之前只有点 ribbon 按钮这条路会做，走「粘贴图片」直接改 bgActive，于是两个模式能同时亮着。
+    function leaveDepthMode() {
+        if (!depthEditor?.isActive()) return;
+        depthEditor.setActive(false);
+        syncDepthBtn();
+        updateUndoButtonsRef?.();
+    }
 
     // 🌟 从 Blob/File 加载背景图（文件上传、粘贴共用）
     function loadBackgroundFromBlob(blob) {
@@ -2035,11 +2047,7 @@ export function createFloatingPanel(node, jsonWidget) {
     // 背景图模式开关：工具条显隐 + 按钮高亮，所有入口都走这里
     function setBgMode(on) {
         bgActive = !!on;
-        if (bgActive && depthEditor?.isActive()) {
-            depthEditor.setActive(false);
-            syncDepthBtn();
-            updateUndoButtonsRef?.();
-        }
+        if (bgActive) leaveDepthMode();
         syncBgMode();
         drawCanvas();
     }
@@ -5038,14 +5046,23 @@ export function createFloatingPanel(node, jsonWidget) {
             ? Array.from(items).find((it) => it.type && it.type.startsWith("image/"))
             : null;
         if (imageItem) {
-            // 焦点不在画布上时 canvas 自己的 paste 监听不会触发，这里补上
-            if (document.activeElement !== canvas) {
-                const file = imageItem.getAsFile();
-                if (file && loadBackgroundFromBlob(file)) {
-                    toast.show("已粘贴背景图");
+            const file = imageItem.getAsFile();
+            // 深度模式下粘的是深度图，绝不能落到背景图上（否则还会顺手把背景图模式打开）
+            if (depthEditor?.isActive()) {
+                if (file) {
+                    depthEditor.importBlob(file).then((ok) => {
+                        if (ok) toast.show("已粘贴深度图（白=近，黑=远）", 2000);
+                    });
                     e.preventDefault();
                     e.stopPropagation();
                 }
+                return;
+            }
+            // 焦点不在画布上时 canvas 自己的 paste 监听不会触发，这里补上
+            if (document.activeElement !== canvas && file && loadBackgroundFromBlob(file)) {
+                toast.show("已粘贴背景图");
+                e.preventDefault();
+                e.stopPropagation();
             }
             return;
         }
@@ -6120,7 +6137,9 @@ export function createFloatingPanel(node, jsonWidget) {
     // 🌟 消费 pending 背景图（放在函数末尾，此时 getCanvasSize / drawCanvas 等全部已初始化）
     if (node._mossPendingBackground) {
         try {
-            applyBackgroundImage(node._mossPendingBackground);
+            // auto：节点回传的图只当底图，不自动进背景图模式，
+            // 否则同一轮执行里注入的深度图层会被它顶掉
+            applyBackgroundImage(node._mossPendingBackground, "auto");
         } catch (e) {
             console.error("[MOSS] 消费 pending 背景图失败:", e);
         }
