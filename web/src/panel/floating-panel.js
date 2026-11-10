@@ -5196,7 +5196,9 @@ export function createFloatingPanel(node, jsonWidget) {
             if (jsonWidget.callback) jsonWidget.callback(jsonWidget.value);
             isUpdatingFromUI = false;
             recordHistory(jsonWidget.value);
-            
+            // 主提示词里改了角色那一行，同步回角色列表
+            scheduleCharacterSync();
+
             if (node.graph) node.graph.setDirtyCanvas(true, true);
         } catch (e) {
             console.error("[MOSS] 更新主提示词失败:", e);
@@ -5223,6 +5225,53 @@ export function createFloatingPanel(node, jsonWidget) {
         return desc ? `${c.name}，${desc}` : c.name;
     }
 
+    // 这一行是不是该角色的行：`名字`、`名字，描述`、`名字,描述`
+    // 逗号是必需的，否则「少女」会误吃「少女A，…」这种行
+    function isCharacterLine(line, name) {
+        if (!line || !name) return false;
+        const t = line.trim();
+        return t === name || t.startsWith(name + "，") || t.startsWith(name + ",");
+    }
+
+    // 取出该行的描述部分（去掉名字和那个逗号）
+    function lineDesc(line, name) {
+        const t = line.trim();
+        return t === name ? "" : t.slice(name.length + 1).trim();
+    }
+
+    // 主提示词 → 角色列表：用户直接在提示词里改角色那一行，描述要跟着回写。
+    // 只认「名字是已有角色」的行，认不出来的一律不动，避免把普通正文当成角色。
+    // 行被整行删掉时保留角色本身（删角色要显式点 ×，否则会连带清掉框描述前缀）。
+    function syncCharactersFromPrompt() {
+        const list = readCharacters();
+        if (!list.length) return;
+        const lines = promptTextarea.value.split("\n");
+        let changed = false;
+        for (const c of list) {
+            const idx = lines.findIndex((l) => isCharacterLine(l, c.name));
+            if (idx === -1) continue;
+            const desc = lineDesc(lines[idx], c.name);
+            // 多行描述写进提示词时会被压成一行，这里按「压平后」比较，
+            // 没真改就别把用户的多行换行吃掉
+            const cur = (c.desc || "").replace(/\s+/g, " ").trim();
+            if (desc !== cur) {
+                c.desc = desc;
+                changed = true;
+            }
+        }
+        if (changed) {
+            writeCharacters(list);
+            renderCharacterList();
+        }
+    }
+
+    // 打字时别每敲一个字符就重排右侧列表
+    let charSyncTimer = 0;
+    function scheduleCharacterSync() {
+        clearTimeout(charSyncTimer);
+        charSyncTimer = setTimeout(syncCharactersFromPrompt, 300);
+    }
+
     function setPromptText(text) {
         promptTextarea.value = text;
         // 复用主提示词的 input 监听，保证 JSON 跟 UI 同步
@@ -5231,8 +5280,18 @@ export function createFloatingPanel(node, jsonWidget) {
 
     function addCharacterToPrompt(c) {
         const line = characterLine(c);
-        const text = promptTextarea.value.replace(/\s+$/, "");
-        setPromptText(text ? `${text}\n\n${line}` : line);
+        const text = promptTextarea.value;
+        const lines = text.split("\n");
+        const idx = lines.findIndex((l) => isCharacterLine(l, c.name));
+        // 已经有这个角色的行：就地改成当前内容，绝不追加第二行
+        if (idx !== -1) {
+            if (lines[idx].trim() === line) return;
+            lines[idx] = line;
+            setPromptText(lines.join("\n"));
+            return;
+        }
+        const body = text.replace(/\s+$/, "");
+        setPromptText(body ? `${body}\n\n${line}` : line);
     }
 
     function removeCharacterFromPrompt(c) {
@@ -5333,17 +5392,22 @@ export function createFloatingPanel(node, jsonWidget) {
         return changed;
     }
 
-    // 改角色时把主提示词里那一行原地替换，不改变它在文中的位置
+    // 改角色时把主提示词里那一行原地替换，不改变它在文中的位置。
+    // 按「名字 + 逗号」定位，不按整行文本匹配——用户手改过描述时整行就匹配不上了，
+    // 以前会当成「没有这个角色」再追加一行，于是主提示词里出现两个同名角色。
     function replaceCharacterInPrompt(oldC, newC) {
-        const oldLine = characterLine(oldC);
-        const newLine = characterLine(newC);
-        const text = promptTextarea.value;
-        const idx = text.indexOf(oldLine);
+        const lines = promptTextarea.value.split("\n");
+        const idx = lines.findIndex((l) => isCharacterLine(l, oldC.name));
         if (idx === -1) {
             addCharacterToPrompt(newC);
             return;
         }
-        setPromptText(text.slice(0, idx) + newLine + text.slice(idx + oldLine.length));
+        const oldLine = characterLine(oldC);
+        lines[idx] = characterLine(newC);
+        // 以前重复追加留下的同款行顺手收掉：只删「和原文一模一样」的行，
+        // 用户自己写的其它内容不动
+        const rest = lines.filter((l, i) => i === idx || l.trim() !== oldLine);
+        setPromptText(rest.join("\n"));
     }
 
     // 改角色名时，把框描述里以旧名字开头的也一起换掉（只动开头，避免误伤正文里同名的词）
@@ -5371,6 +5435,7 @@ export function createFloatingPanel(node, jsonWidget) {
     }
 
     async function editCharacterAt(index) {
+        syncCharactersFromPrompt(); // 先按提示词里的最新内容刷新描述
         const current = readCharacters()[index];
         if (!current) return;
         const result = await showCharacterDialog({
