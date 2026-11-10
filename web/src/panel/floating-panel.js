@@ -5294,15 +5294,26 @@ export function createFloatingPanel(node, jsonWidget) {
         setPromptText(body ? `${body}\n\n${line}` : line);
     }
 
+    // 删行后收拾空行：连续的多个空行压成一个，首尾空行去掉。
+    // 只动空行，正文一个字不碰。
+    function collapseBlankRuns(lines) {
+        const out = [];
+        for (const l of lines) {
+            if (!l.trim() && out.length && !out[out.length - 1].trim()) continue;
+            out.push(l);
+        }
+        while (out.length && !out[0].trim()) out.shift();
+        while (out.length && !out[out.length - 1].trim()) out.pop();
+        return out;
+    }
+
     function removeCharacterFromPrompt(c) {
-        const line = characterLine(c);
-        const text = promptTextarea.value;
-        const idx = text.indexOf(line);
-        // 用户手改过主提示词、匹配不到就跳过，不误删别的文本
-        if (idx === -1) return;
-        const before = text.slice(0, idx).replace(/\s+$/, "");
-        const after = text.slice(idx + line.length).replace(/^\s+/, "");
-        setPromptText(before && after ? `${before}\n\n${after}` : before || after);
+        const lines = promptTextarea.value.split("\n");
+        // 按名字定位，不按整行：手改过描述之后整行文本对不上，
+        // 以前会「匹配不到就跳过」，角色删了那一行还赖在提示词里。
+        const kept = lines.filter((l) => !isCharacterLine(l, c.name));
+        if (kept.length === lines.length) return; // 提示词里本来就没有这一行
+        setPromptText(collapseBlankRuns(kept).join("\n"));
     }
 
     // 描述开头是不是某个角色名（中英文逗号都认）
