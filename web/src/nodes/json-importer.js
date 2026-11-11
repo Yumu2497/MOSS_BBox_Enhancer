@@ -392,6 +392,7 @@ export const jsonImporterExtension = {
                     alert(result.error);
                     return;
                 }
+                console.log("[MOSS] 准备写入 layout_json:", (result.value || "").length, "字符");
                 setLayoutValue(result.value);
                 if (Number.isFinite(result.width) && Number.isFinite(result.height)) {
                     setCanvasSize(result.width, result.height);
@@ -405,8 +406,12 @@ export const jsonImporterExtension = {
                     console.log("[MOSS] 导入范围:", mode);
 
                     const file = await pickImageFile();
-                    if (!file) return;
-                    console.log("[MOSS] 选择了文件:", file.name);
+                    console.log("[MOSS] 选择了文件:", file ? file.name : "(无)");
+                    if (!file) {
+                        // 以前这里是静默 return，取消和真失败看起来一模一样
+                        alert("未选择图片，或文件框已取消，导入未执行。");
+                        return;
+                    }
 
                     const formData = new FormData();
                     formData.append("image", file);

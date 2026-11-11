@@ -147,21 +147,29 @@ export function pickImageFile() {
         document.body.appendChild(input);
 
         let done = false;
-        const finish = (file) => {
+        let focusTimer = 0;
+        const finish = (file, reason) => {
             if (done) return;
             done = true;
+            clearTimeout(focusTimer);
             window.removeEventListener("focus", onFocus);
             input.remove();
+            console.log("[MOSS] 文件框结束:", reason, file ? file.name : "");
             resolve(file || null);
         };
+        // 旧实现：focus 回来后 300ms 检查 input.files，空就当「取消」。
+        // 但用户还在文件对话框里翻目录时 focus 也可能先回来，300ms 一过就把
+        // Promise 以 null 结束；之后 change 到了也被 done 挡掉，请求根本不发，
+        // 界面表现就是「点了没反应」。新生成的图常放在子目录，挑得久就必现。
+        // 现在 focus 只启动一个很长的兜底计时器，change / cancel 一到立即清掉。
         const onFocus = () => {
-            // 文件框关闭后窗口会重新获得焦点；给 change 一点时间先到
-            setTimeout(() => {
-                if (!input.files || !input.files.length) finish(null);
-            }, 300);
+            clearTimeout(focusTimer);
+            focusTimer = setTimeout(() => {
+                if (!done && (!input.files || !input.files.length)) finish(null, "超时或取消");
+            }, 60000);
         };
-        input.addEventListener("change", () => finish(input.files && input.files[0]));
-        input.addEventListener("cancel", () => finish(null));
+        input.addEventListener("change", () => finish(input.files && input.files[0], "已选文件"));
+        input.addEventListener("cancel", () => finish(null, "用户取消"));
         window.addEventListener("focus", onFocus);
         input.click();
     });
